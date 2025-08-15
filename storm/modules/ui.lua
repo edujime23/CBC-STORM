@@ -1,5 +1,5 @@
 -- /storm/modules/ui.lua
--- Controller UI: cursor-safe, hotkeys never leak, UI handles all prompts.
+-- Controller UI: cursor-safe, hotkeys never leak, UI handles prompts. Adds Workers view with Ping.
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -28,7 +28,7 @@ end
 
 local function footer()
   local _, h = term.getSize()
-  safe_write_line(h, "[P] Pair  [A] Approvals  [Q] Quit")
+  safe_write_line(h, "[P] Pair  [A] Approvals  [W] Workers  [Q] Quit")
 end
 
 local function pairing_info()
@@ -140,7 +140,6 @@ local function approvals_screen()
       local inp = read_line_filtered("> ", allow_approvals_char)
       if not inp then break
       elseif inp == "" then
-        -- refresh
       elseif inp:lower() == "q" then
         break
       elseif inp:match("^%d+$") then
@@ -160,6 +159,45 @@ local function approvals_screen()
   term.clear(); header(); footer(); pairing_info()
 end
 
+local function workers_screen()
+  M.suspend_ticks = true
+  term.clear(); header()
+  local _, h = term.getSize()
+  while true do
+    local list = Join.get_workers()
+    term.setCursorPos(1, 3); term.clearLine(); term.write("Workers:")
+    for i = 1, math.max(10, #list) do
+      term.setCursorPos(1, 3 + i); term.clearLine()
+      local w = list[i]
+      if w then
+        local rtt = w.last_rtt and (tostring(w.last_rtt).."ms") or "n/a"
+        term.write(("[%d] dev=%s  modem=%s  rtt=%s"):format(
+          i, tostring(w.dev_id), tostring(w.modem or "?"), rtt))
+      end
+    end
+    safe_write_line(h - 2, "Type 'pN' to ping (e.g., p1), 'q' to exit.")
+    local function allow_workers_char(c) return (c >= '0' and c <= '9') or c=='p' or c=='P' or c=='q' or c=='Q' end
+    local inp = read_line_filtered("> ", allow_workers_char)
+    if not inp then break
+    elseif inp == "" then
+    elseif inp:lower() == "q" then break
+    elseif inp:match("^[pP]%d+$") then
+      local idx = tonumber(string.sub(inp, 2))
+      local w = list[idx]
+      term.setCursorPos(1, h - 3); term.clearLine()
+      if w then
+        local ok, err = Join.ping_worker(w.dev_id)
+        if ok then term.write("Ping sent to dev="..tostring(w.dev_id).." (check RTT next refresh).")
+        else term.write("Ping failed: "..tostring(err)) end
+      else
+        term.write("Invalid index.")
+      end
+    end
+  end
+  M.suspend_ticks = false
+  term.clear(); header(); footer(); pairing_info()
+end
+
 function M.run()
   term.clear(); header(); footer(); pairing_info()
   local function key_loop()
@@ -169,6 +207,8 @@ function M.run()
         pair_wizard()
       elseif k == keys.a then
         approvals_screen()
+      elseif k == keys.w then
+        workers_screen()
       elseif k == keys.q then
         return
       end

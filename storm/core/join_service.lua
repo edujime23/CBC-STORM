@@ -20,7 +20,8 @@ local M = {
   _modem           = nil,
   _modem_name      = nil,
   _last_ready_ms   = 0,
-  sessions         = {}
+  sessions         = {},   -- dev_id -> session
+  registry         = {},   -- dev_id -> {dev_id, lease, modem, channel, last_rtt, last_ping_ts}
 }
 
 local function cfg_attempt_limit() return (Cfg.security and Cfg.security.pairing_attempt_limit) or 4 end
@@ -107,7 +108,7 @@ local function is_port_secure(port)
   return true
 end
 
--- NEW: Start pairing on a given port. Called by UI (no read() here)
+-- Start pairing on a given port (called by UI)
 function M.start_pairing_on_port(port)
   modem_or_error()
   local isW = (M._modem.isWireless and M._modem.isWireless()) and true or false
@@ -126,7 +127,7 @@ function M.start_pairing_on_port(port)
   M.code    = ("%04d"):format(math.random(0, 9999))
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
-  M.attempts, M.quarantine, M.sessions, M.pending, M.approved = {}, {}, {}, {}, {}
+  M.attempts, M.quarantine, M.sessions, M.pending, M.approved, M.registry = {}, {}, {}, {}, {}, {}
   M._last_ready_ms = 0
 
   Log.info("system", ("Pairing started on %s port %d with code %s"):format(M._modem_name or "modem", M.port, M.code))
@@ -147,6 +148,34 @@ function M.get_active_code()  return M.pairing_active and M.code or nil end
 function M.get_active_port()  return M.pairing_active and M.port or nil end
 function M.get_pending()      return M.pending end
 
+-- Expose workers (approved) for UI
+function M.get_workers()
+  local list = {}
+  for dev, rec in pairs(M.registry) do
+    list[#list+1] = {
+      dev_id = dev,
+      modem  = rec.modem,
+      channel= rec.channel,
+      last_rtt = rec.last_rtt,
+      lease = rec.lease
+    }
+  end
+  table.sort(list, function(a,b) return tostring(a.dev_id) < tostring(b.dev_id) end)
+  return list
+end
+
+-- Ping a worker over encrypted session
+function M.ping_worker(dev_id)
+  local sess = M.sessions[dev_id]
+  if not sess then return false, "no_session" end
+  local frame = Net.wrap(sess, { type="PING", ts=now() }, { dev = dev_id })
+  send_on(frame)
+  -- remember when we pinged
+  local r = M.registry[dev_id]
+  if r then r.last_ping_ts = now() end
+  return true
+end
+
 local function push_pending(hello)
   local id = ("%d-%06d"):format(hello.device_id or 0, math.random(100000, 999999))
   local rec = { id = id, hello = hello, ch = M.port, side = M._modem_name or "modem", ts = now() }
@@ -163,18 +192,29 @@ function M.approve_index(i)
     Log.warn("pairing", "No session for approved device; cannot send WELCOME")
     return false, "no_session"
   end
+  local dev_id = rec.hello.device_id
   local lease = HS.issue_lease(rec.hello, Cfg.security.lease_ttl_ms, {
     caps = { can_fire = true, can_aim = true },
     min_cooldown_ms = (Cfg.security and Cfg.security.min_cooldown_ms) or 3000
   })
-  -- Only include lease; do not duplicate policy at top-level
   local frame = Net.wrap(sess, {
     type       = "JOIN_WELCOME",
     accepted   = true,
     cluster_id = Cfg.system.cluster_id,
     lease      = lease
-  }, { dev = rec.hello.device_id })
+  }, { dev = dev_id })
   send_on(frame)
+
+  -- Register worker in registry
+  M.registry[dev_id] = {
+    dev_id = dev_id,
+    lease  = lease,
+    modem  = M._modem_name or "modem",
+    channel= M.port,
+    last_rtt = nil,
+    last_ping_ts = nil
+  }
+
   table.insert(M.approved, { id = rec.id, lease = lease, hello = rec.hello, ts = now() })
   table.remove(M.pending, i)
   Log.info("system", ("Approved join: %s"):format(rec.id))
@@ -224,7 +264,6 @@ local function handle_join_hello(msg)
     return
   end
 
-  -- Send seed and create session
   local seed = HS.build_welcome_seed(dev_id, M.code, msg.nonceW)
   send_on(seed)
   local sess = HS.derive_pair_session(M.code, dev_id, msg.nonceW, seed.nonceM, Net)
@@ -235,8 +274,36 @@ local function handle_join_hello(msg)
   send_on(ack)
 end
 
+local function handle_enc_frame(frame)
+  -- Try to unwrap with all sessions (we don't have dev_id in outer frame)
+  for dev_id, sess in pairs(M.sessions) do
+    local inner, err = Net.unwrap(sess, frame, { dev = dev_id })
+    if inner then
+      if inner.type == "PONG" then
+        local r = M.registry[dev_id]
+        if r and r.last_ping_ts then
+          r.last_rtt = now() - r.last_ping_ts
+          r.last_ping_ts = nil
+          Log.info("pairing", ("PONG from dev=%s rtt=%dms"):format(tostring(dev_id), r.last_rtt))
+        end
+      elseif inner.type == "JOIN_ACK" or inner.type == "JOIN_WELCOME" then
+        -- Ignore here (handled in pairing flow)
+      else
+        Log.info("pairing", ("ENC from dev=%s type=%s"):format(tostring(dev_id), tostring(inner.type)))
+      end
+      return true
+    end
+  end
+  return false
+end
+
 local function handle_modem_message(side, channel, replyChannel, msg, dist)
   Log.info("pairing", ("RX on %s ch=%s type=%s"):format(M._modem_name or "modem", tostring(channel), (type(msg)=="table" and msg.type) or type(msg)))
+  if type(msg)=="table" and msg.type=="ENC" then
+    handle_enc_frame(msg)
+    return
+  end
+
   if not M.pairing_active then
     if type(msg)=="table" and msg.type=="PAIR_PROBE" and channel==M.port then
       send_on({ type = "PAIR_READY", port = M.port })
@@ -278,4 +345,16 @@ function M.run()
   end
 end
 
-return M
+-- Expose for UI
+return {
+  run = M.run,
+  start_pairing_on_port = M.start_pairing_on_port,
+  stop_pairing = M.stop_pairing,
+  get_active_code = M.get_active_code,
+  get_active_port = M.get_active_port,
+  get_pending = M.get_pending,
+  approve_index = M.approve_index,
+  deny_index = M.deny_index,
+  get_workers = M.get_workers,
+  ping_worker = M.ping_worker
+}
