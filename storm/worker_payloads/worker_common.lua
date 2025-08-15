@@ -1,5 +1,6 @@
--- /storm/worker_payloads/worker_common.lua
--- Worker common: pairing scan + onboarding (skeleton)
+-- PATCH 2: /storm/worker_payloads/worker_common.lua
+-- Fix: Close candidate channels after each scan attempt; ensure we never accumulate >128 opens.
+-- Also reset modem channels at the beginning to clear any leftovers.
 
 local U  = require("/storm/lib/utils")
 local L  = require("/storm/lib/logger")
@@ -19,14 +20,15 @@ end
 
 function M.init()
   L.info("worker", "Init common worker stub")
+  local m = peripheral.find("modem")
+  if m and m.closeAll then m.closeAll() end
 end
 
 function M.find_pairing()
   local modem = modem_or_error()
 
-  -- Open and scan channels for current and neighbor epochs with shared salt "global"
   local window_ms = 5000
-  local attempts = 0
+  local attempts  = 0
 
   while attempts < 12 do
     local e = math.floor(U.now_ms() / window_ms)
@@ -36,13 +38,20 @@ function M.find_pairing()
       H.schedule("join_secret", "join", e+1, "global")
     }
 
-    -- Open all candidate channels
+    -- Open these three channels only for this attempt
+    local opened = {}
     for _, ch in ipairs(candidates) do
-      if not modem.isOpen(ch) then modem.open(ch) end
+      if not modem.isOpen(ch) then
+        pcall(function() modem.open(ch) end)
+        opened[#opened+1] = ch
+      else
+        opened[#opened+1] = ch
+      end
     end
 
-    -- Listen briefly for any beacon on those channels
-    local t = os.startTimer(0.5)
+    -- Listen briefly
+    local t = os.startTimer(0.6)
+    local found = nil
     while true do
       local ev, p1, p2, p3, p4, p5 = os.pullEvent()
       if ev == "timer" and p1 == t then
@@ -50,16 +59,24 @@ function M.find_pairing()
       elseif ev == "modem_message" then
         local side, rch, replyCh, msg, dist = p1, p2, p3, p4, p5
         if type(msg) == "table" and msg.type == "PAIR_BEACON" then
-          -- Accept beacons on any of the candidate channels
           for _, ch in ipairs(candidates) do
             if rch == ch then
               print("Found cluster: " .. tostring(msg.cluster_id) .. " (ch " .. tostring(ch) .. ")")
-              return { channel = ch, beacon = msg }
+              found = { channel = ch, beacon = msg }
+              break
             end
           end
+          if found then break end
         end
       end
     end
+
+    -- Close channels opened in this attempt to respect 128 limit
+    for _, ch in ipairs(opened) do
+      if modem.isOpen and modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+    end
+
+    if found then return found end
 
     attempts = attempts + 1
   end
@@ -74,7 +91,10 @@ function M.onboard(node_kind, caps, join_info)
 
   local modem = modem_or_error()
   local ch = join_info.channel
-  if not modem.isOpen(ch) then modem.open(ch) end
+
+  -- Ensure only the onboarding channel is open during handshake
+  if modem.closeAll then modem.closeAll() end
+  if not modem.isOpen(ch) then pcall(function() modem.open(ch) end) end
 
   local hello = HS.build_join_hello({
     node_kind = node_kind,
@@ -88,10 +108,14 @@ function M.onboard(node_kind, caps, join_info)
   while true do
     local ev, p1, p2, p3, p4, p5 = os.pullEvent()
     if ev == "timer" and p1 == timer then
+      -- close the channel on timeout to avoid leaking open channels
+      if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
       return false, "timeout"
     elseif ev == "modem_message" then
       local side, rch, replyCh, msg, dist = p1, p2, p3, p4, p5
       if rch == ch and type(msg) == "table" and msg.type == "JOIN_WELCOME" then
+        -- close it now; post-onboarding we’ll open the secure session channel
+        if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
         if msg.accepted then
           M.lease = msg.lease
           M.state = "ESTABLISHED"
