@@ -1,9 +1,10 @@
 -- /storm/encryption/handshake.lua
--- Onboarding + simple lease issuance (skeleton). Uses placeholders until real crypto is plugged in.
+-- Onboarding + simple lease issuance (skeleton). Adds debug prints.
 
 local U = require("/storm/lib/utils")
 local Crypto = require("/storm/encryption/crypto")
 
+local DEBUG = true
 local M = {}
 
 local function poor_hash(s)
@@ -21,26 +22,37 @@ end
 
 -- Worker-side: build JOIN_HELLO
 function M.build_join_hello(opts)
-  -- opts: {node_kind, device_id, code, caps?}
-  return {
+  local hello = {
     type = "JOIN_HELLO",
     node_kind = opts.node_kind or "worker",
     device_id = opts.device_id or os.getComputerID(),
     nonce = poor_hash(uuid() .. tostring(os.clock())),
-    code = opts.code, -- plaintext for now; will become HMAC(code, transcript)
+    code = opts.code, -- plaintext for now
     caps = opts.caps or {},
     ts = U.now_ms()
   }
+  if DEBUG then
+    print(("[Handshake] build_join_hello dev=%s kind=%s code=%s ts=%s")
+      :format(tostring(hello.device_id), tostring(hello.node_kind), tostring(hello.code), tostring(hello.ts)))
+  end
+  return hello
 end
 
 -- Master-side: verify JOIN_HELLO
 function M.verify_join_hello(hello, active_code)
   if type(hello) ~= "table" or hello.type ~= "JOIN_HELLO" then
+    if DEBUG then print("[Handshake] verify: bad_msg") end
     return false, "bad_msg"
   end
-  if not active_code or hello.code ~= active_code then
+  if DEBUG then
+    print(("[Handshake] verify: dev=%s kind=%s code=%s active=%s")
+      :format(tostring(hello.device_id), tostring(hello.node_kind), tostring(hello.code), tostring(active_code)))
+  end
+  if not active_code or tostring(hello.code) ~= tostring(active_code) then
+    if DEBUG then print("[Handshake] verify: bad_code") end
     return false, "bad_code"
   end
+  if DEBUG then print("[Handshake] verify: ok") end
   return true
 end
 
@@ -56,6 +68,10 @@ function M.issue_lease(worker_info, ttl_ms, policy)
     policy = policy or { min_cooldown_ms = 3000 },
     sig = "master_sig_stub"
   }
+  if DEBUG then
+    print(("[Handshake] issue_lease id=%s node=%s expires=%s")
+      :format(lease.lease_id, tostring(lease.node_id), tostring(lease.expires_ms)))
+  end
   return lease
 end
 

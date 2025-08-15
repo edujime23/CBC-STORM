@@ -1,6 +1,5 @@
 -- /storm/modules/ui.lua
 -- Controller UI: secure pairing (ask port), approvals screen.
-
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -25,8 +24,6 @@ local function pairing_info()
   local _, h = term.getSize()
   term.setCursorPos(1, h - 1); term.clearLine()
   if code and port then
-    term.write(("Pairing active. Port: %d  Code: %s (4-digit)").format and "" or "") -- CC lacks string.format on concatenation
-    term.setCursorPos(1, h - 1); term.clearLine()
     term.write("Pairing active. Port: " .. tostring(port) .. "  Code: " .. tostring(code))
   else
     term.write("Pairing idle.")
@@ -69,9 +66,10 @@ end
 
 function M.run()
   term.clear(); header(); footer(); pairing_info()
-  while true do
-    local ev, k = os.pullEvent()
-    if ev == "key" then
+
+  local function key_loop()
+    while true do
+      local _, k = os.pullEvent("key") -- IMPORTANT: only consume key events
       if k == keys.p then
         term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")
         Join.start_pairing_interactive()
@@ -81,9 +79,16 @@ function M.run()
         return
       end
     end
-    pairing_info()
-    U.sleep_ms(100)
   end
+
+  local function tick_loop()
+    while true do
+      pairing_info()
+      U.sleep_ms(200)
+    end
+  end
+
+  parallel.waitForAny(key_loop, tick_loop)
 end
 
 return M
