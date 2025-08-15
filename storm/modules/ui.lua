@@ -1,5 +1,5 @@
 -- /storm/modules/ui.lua
--- Controller UI: cursor-safe, hotkeys never leak into prompts, UI does all prompts.
+-- Controller UI: cursor-safe, hotkeys never leak, UI handles all prompts.
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -43,16 +43,14 @@ local function pairing_info()
   end
 end
 
--- Flush pending char events to avoid hotkey leaking into next prompt
 local function flush_chars(ms)
   local duration = (ms or 0.05)
   local timer = os.startTimer(duration)
   while true do
     local fired = false
-    local got_char = false
     parallel.waitForAny(
       function() local _, t = os.pullEvent("timer"); if t == timer then fired = true end end,
-      function() local _ = os.pullEvent("char"); got_char = true end
+      function() os.pullEvent("char") end
     )
     if fired then break end
   end
@@ -96,10 +94,9 @@ end
 local function pair_wizard()
   M.suspend_ticks = true
   term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")
-  -- Port input: digits only
   local function allow_digits(c) return c >= '0' and c <= '9' end
   while true do
-    local inp = read_line_filtered("Enter secure pairing port (0-65535): ", allow_digits)
+    local inp = read_line_filtered("Enter secure pairing port (0-65535) [Esc cancel]: ", allow_digits)
     if not inp or inp == "" then break end
     local port = tonumber(inp)
     if not port or port < 0 or port > 65535 then
@@ -120,33 +117,43 @@ local function approvals_screen()
   term.clear(); header()
   local _, h = term.getSize()
   while true do
-    term.setCursorPos(1, 3); term.clearLine(); term.write("Pending join requests:")
     local list = Join.get_pending()
-    for i = 1, 10 do
+    term.setCursorPos(1, 3); term.clearLine(); term.write("Pending join requests:")
+    for i = 1, math.max(10, #list) do
       term.setCursorPos(1, 3 + i); term.clearLine()
       local rec = list[i]
       if rec then
         term.write(("[%d] id=%s  kind=%s  dev=%s  age=%ds"):format(
           i, rec.id, tostring(rec.hello.node_kind), tostring(rec.hello.device_id),
-          math.floor((U.now_ms() - rec.ts) / 1000)
-        ))
+          math.floor((U.now_ms() - rec.ts) / 1000)))
       end
     end
-    safe_write_line(h - 2, "Enter number to approve, 'dN' to deny (e.g., d1), ENTER to refresh, ESC to exit.")
-    local function allow_approvals_char(c) return (c >= '0' and c <= '9') or c=='d' or c=='D' end
-    local inp = read_line_filtered("> ", allow_approvals_char)
-    if not inp or inp == "" then
-      -- refresh
-    elseif inp:match("^%d+$") then
-      local idx = tonumber(inp)
-      local ok, err = Join.approve_index(idx)
-      if not ok then L.warn("system", "Approve failed: "..tostring(err)) end
-    elseif inp:match("^[dD]%d+$") then
-      local idx = tonumber(string.sub(inp, 2))
-      local ok, err = Join.deny_index(idx)
-      if not ok then L.warn("system", "Deny failed: "..tostring(err)) end
-    elseif inp == nil then
-      break
+
+    if #list == 0 then
+      safe_write_line(h - 2, "No pending join requests. Press ESC or 'q' to return.")
+      local function allow_empty(c) return c=='q' or c=='Q' end
+      local inp = read_line_filtered("> ", allow_empty)
+      if inp == nil or inp:lower() == 'q' then break end
+    else
+      safe_write_line(h - 2, "Enter number to approve, 'dN' to deny (e.g., d1), or 'q' to exit.")
+      local function allow_approvals_char(c) return (c >= '0' and c <= '9') or c=='d' or c=='D' or c=='q' or c=='Q' end
+      local inp = read_line_filtered("> ", allow_approvals_char)
+      if not inp then break
+      elseif inp == "" then
+        -- refresh
+      elseif inp:lower() == "q" then
+        break
+      elseif inp:match("^%d+$") then
+        local idx = tonumber(inp)
+        local ok, err = Join.approve_index(idx)
+        term.setCursorPos(1, h - 3); term.clearLine()
+        if ok then term.write("Approved #" .. idx) else term.write("Approve failed: "..tostring(err)) end
+      elseif inp:match("^[dD]%d+$") then
+        local idx = tonumber(string.sub(inp, 2))
+        local ok, err = Join.deny_index(idx)
+        term.setCursorPos(1, h - 3); term.clearLine()
+        if ok then term.write("Denied #" .. idx) else term.write("Deny failed: "..tostring(err)) end
+      end
     end
   end
   M.suspend_ticks = false

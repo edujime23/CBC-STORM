@@ -1,12 +1,19 @@
 -- /storm/worker_payloads/worker_common.lua
--- Require wireless modem; if none, error. Probes for PAIR_READY, then HELLO.
+-- Worker pairing with PAIR_PROBE fallback + encrypted ACK/WELCOME + main loop.
 
 local U   = require("/storm/lib/utils")
 local Log = require("/storm/lib/logger")
 local HS  = require("/storm/encryption/handshake")
 local Net = require("/storm/encryption/netsec")
 
-local M = { state = "CONNECTING", lease = nil, _modem=nil, _name=nil }
+local M = {
+  state   = "CONNECTING",
+  lease   = nil,
+  _modem  = nil,
+  _name   = nil,
+  session = nil,
+  channel = nil
+}
 
 local function pick_wireless_modem()
   local names = peripheral.getNames()
@@ -39,20 +46,22 @@ end
 
 local function read_number(prompt, minv, maxv)
   while true do
-    term.setCursorPos(1, 3); term.clearLine(); io.write(prompt)
+    local _, h = term.getSize()
+    term.setCursorPos(1, h-1); term.clearLine(); io.write(prompt)
     local s = read()
     local n = tonumber(s)
     if n and n >= minv and n <= maxv then return n end
-    term.setCursorPos(1, 4); term.clearLine(); print(("Enter a number between %d and %d."):format(minv, maxv))
+    term.setCursorPos(1, h-2); term.clearLine(); print(("Enter a number between %d and %d."):format(minv, maxv))
   end
 end
 
 local function read_code4(prompt)
   while true do
-    term.setCursorPos(1, 5); term.clearLine(); io.write(prompt)
+    local _, h = term.getSize()
+    term.setCursorPos(1, h-1); term.clearLine(); io.write(prompt)
     local s = read()
     if s and s:match("^%d%d%d%d$") then return s end
-    term.setCursorPos(1, 6); term.clearLine(); print("Enter exactly 4 digits (0000-9999).")
+    term.setCursorPos(1, h-2); term.clearLine(); print("Enter exactly 4 digits (0000-9999).")
   end
 end
 
@@ -132,9 +141,11 @@ function M.onboard(node_kind, caps, join_info)
             timer = os.startTimer(60)
           elseif inner.type=="JOIN_WELCOME" then
             if inner.accepted then
-              if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-              M.lease = inner.lease
-              M.state = "ESTABLISHED"
+              -- Keep channel open for further encrypted commands
+              M.lease   = inner.lease
+              M.state   = "ESTABLISHED"
+              M.session = sess
+              M.channel = ch
               print("Paired. Lease: " .. tostring(M.lease.lease_id))
               return true
             else
@@ -167,6 +178,34 @@ function M.onboard(node_kind, caps, join_info)
       ::continue::
     end
   end
+end
+
+-- Service loop: stay alive and handle encrypted commands
+function M.run_service()
+  if not (M.session and M.channel) then
+    print("[Worker] No session/channel; nothing to do.")
+    return
+  end
+  local modem = modem_or_error()
+  print("[Worker] Entering service loop on channel "..tostring(M.channel).." (encrypted).")
+  while true do
+    local ev, side, ch, reply, msg, dist = os.pullEvent()
+    if ev == "modem_message" and ch == M.channel and type(msg)=="table" and msg.type=="ENC" then
+      local inner, err = Net.unwrap(M.session, msg, { dev=os.getComputerID() })
+      if inner then
+        if inner.type == "PING" then
+          local resp = Net.wrap(M.session, { type="PONG", ts=U.now_ms() }, { dev=os.getComputerID() })
+          modem.transmit(M.channel, M.channel, resp)
+        elseif inner.type == "SHUTDOWN" then
+          print("[Worker] SHUTDOWN received.")
+          break
+        elseif inner.type == "LOG" then
+          print("[Worker] LOG: "..tostring(inner.msg))
+        end
+      end
+    end
+  end
+  if modem.isOpen(M.channel) then pcall(function() modem.close(M.channel) end) end
 end
 
 return M

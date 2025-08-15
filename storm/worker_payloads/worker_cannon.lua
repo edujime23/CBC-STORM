@@ -52,3 +52,5 @@ if not ok then
 end
 
 print("Ready to receive lease-driven commands (encrypted session established).")
+-- Stay alive and listen for commands
+Common.run_service()
