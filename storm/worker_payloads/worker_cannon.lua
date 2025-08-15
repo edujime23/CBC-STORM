@@ -1,8 +1,6 @@
 -- /storm/worker_payloads/worker_cannon.lua
 -- Entry point: Cannon Worker — detect peripheral, pair, and get a lease (next: secure channel)
 
-package.path = "/?.lua;/?/init.lua;" .. package.path
-
 local Common = require("/storm/worker_payloads/worker_common")
 local U = require("/storm/lib/utils")
 
@@ -10,7 +8,7 @@ print("CBC-STORM v4.0 — Cannon Worker")
 
 local periph
 do
-  local names = { "cbc:cannonMount", "cbc:compactCannonMount", "cannonMount", "compactCannonMount" }
+  local names = { "cbc_cannon_mount", "cbc_compact_cannon_mount" }
   for _, n in ipairs(names) do
     local list = { peripheral.find(n) }
     if #list > 0 then periph = list[1]; break end
