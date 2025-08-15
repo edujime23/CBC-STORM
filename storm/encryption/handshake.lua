@@ -72,16 +72,36 @@ function HS.derive_pair_session(code, dev_id, nonceW, nonceM, NetSec)
   return NetSec.derive_session(key, nonceW, nonceM)
 end
 
+local function deepcopy(v)
+  if type(v) ~= "table" then return v end
+  local t = {}
+  for k, x in pairs(v) do t[k] = deepcopy(x) end
+  return t
+end
+
 function HS.issue_lease(worker_info, ttl_ms, policy)
+  -- Avoid repeated table references: deep copy both policy and caps
+  local pol = {}
+  local caps = { can_fire = true, can_aim = true }
+  if type(policy) == "table" then
+    -- copy policy without caps
+    for k, v in pairs(policy) do
+      if k ~= "caps" then pol[k] = deepcopy(v) end
+    end
+    if type(policy.caps) == "table" then
+      caps = deepcopy(policy.caps)
+    end
+  end
+
   local lease = {
-    lease_id = Crypto.hex(Crypto.random(8)),
-    node_id = worker_info.device_id or 0,
+    lease_id  = Crypto.hex(Crypto.random(8)),
+    node_id   = worker_info.device_id or 0,
     node_kind = worker_info.node_kind or "worker",
     issued_ms = U.now_ms(),
-    expires_ms = U.now_ms() + (ttl_ms or (24*60*60*1000)),
-    caps = policy and policy.caps or { can_fire = true, can_aim = true },
-    policy = policy or { min_cooldown_ms = 3000 },
-    sig = "master_sig_stub"
+    expires_ms= U.now_ms() + (ttl_ms or (24*60*60*1000)),
+    caps      = caps,      -- separate table
+    policy    = pol,       -- separate table (no nested caps)
+    sig       = "master_sig_stub"
   }
   if DEBUG then
     print(("[Handshake] issue_lease id=%s node=%s expires=%s")

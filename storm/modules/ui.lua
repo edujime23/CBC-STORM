@@ -1,6 +1,5 @@
 -- /storm/modules/ui.lua
 -- Controller UI: secure pairing (ask port), approvals screen, cursor-safe drawing.
-
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -44,10 +43,69 @@ local function pairing_info()
   end
 end
 
+-- Flush any pending 'char' events for a short window (does not consume modem_message).
+local function flush_chars(ms)
+  local duration = (ms or 0.05)
+  local timer = os.startTimer(duration)
+  while true do
+    local fired = false
+    local got_char = false
+    parallel.waitForAny(
+      function() local _, t = os.pullEvent("timer"); if t == timer then fired = true end end,
+      function() local _ = os.pullEvent("char"); got_char = true end
+    )
+    if fired then break end
+    -- if we saw a char, loop continues until timer fires
+  end
+end
+
+-- Read a line using only 'char' + 'key' events (no other events are consumed).
+-- allowed: function(c) -> bool, validates accepted chars (e.g., digits + 'd').
+local function read_line_filtered(prompt, allowed)
+  -- draw prompt
+  local _, h = term.getSize()
+  term.setCursorPos(1, h - 1); term.clearLine(); term.write(prompt)
+  local buf = ""
+  -- Remove any stale char events from the key used to enter the menu
+  flush_chars(0.05)
+
+  while true do
+    local got_char, ch
+    local got_key, key
+    parallel.waitForAny(
+      function() local _, c = os.pullEvent("char"); got_char = true; ch = c end,
+      function() local _, k = os.pullEvent("key");  got_key  = true; key = k end
+    )
+    if got_char then
+      if (not allowed) or allowed(ch) then
+        buf = buf .. ch
+        term.write(ch)
+      end
+    elseif got_key then
+      if key == keys.enter then
+        print("") -- move cursor
+        return buf
+      elseif key == keys.backspace then
+        if #buf > 0 then
+          local x, y = term.getCursorPos()
+          term.setCursorPos(x-1, y)
+          term.write(" ")
+          term.setCursorPos(x-1, y)
+          buf = string.sub(buf, 1, #buf - 1)
+        end
+      elseif key == keys.escape then
+        print("")
+        return nil
+      end
+    end
+  end
+end
+
 local function approvals_screen()
   M.suspend_ticks = true
   term.clear(); header()
   local _, h = term.getSize()
+
   while true do
     term.setCursorPos(1, 3); term.clearLine(); term.write("Pending join requests:")
     local list = Join.get_pending()
@@ -63,21 +121,30 @@ local function approvals_screen()
     end
 
     safe_write_line(h - 2, "Enter number to approve, 'dN' to deny (e.g., d1), ENTER to refresh, ESC to exit.")
-    term.setCursorPos(1, h - 1); term.clearLine(); term.write("> ")
-    local inp = read()
-    if inp == "" then
-    elseif inp == "\27" then
-      break
+
+    -- Allowed characters: digits and 'd'/'D'
+    local function allow_approvals_char(c)
+      return (c >= '0' and c <= '9') or c == 'd' or c == 'D'
+    end
+    local inp = read_line_filtered("> ", allow_approvals_char)
+    if not inp or inp == "" then
+      -- refresh
     elseif inp:match("^%d+$") then
       local idx = tonumber(inp)
-      if not Join.approve_index(idx) then L.warn("system", "Approve failed: invalid index") end
-    elseif inp:match("^d%d+$") then
-      local idx = tonumber(inp:sub(2))
-      if not Join.deny_index(idx) then L.warn("system", "Deny failed: invalid index") end
+      local ok, err = Join.approve_index(idx)
+      if not ok then
+        L.warn("system", "Approve failed: "..tostring(err))
+      end
+    elseif inp:match("^[dD]%d+$") then
+      local idx = tonumber(string.sub(inp, 2))
+      local ok, err = Join.deny_index(idx)
+      if not ok then
+        L.warn("system", "Deny failed: "..tostring(err))
+      end
     end
   end
-  M.suspend_ticks = false
-  term.clear(); header(); footer(); pairing_info()
+
+  -- not reached; if you add a quit option, set M.suspend_ticks=false, redraw header/footer etc.
 end
 
 function M.run()
@@ -89,6 +156,7 @@ function M.run()
       if k == keys.p then
         M.suspend_ticks = true
         term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")
+        -- We keep Join.start_pairing_interactive() for now (has its own prompts)
         Join.start_pairing_interactive()
         M.suspend_ticks = false
         header(); footer(); pairing_info()
