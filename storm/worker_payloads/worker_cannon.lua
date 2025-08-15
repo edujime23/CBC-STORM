@@ -40,38 +40,40 @@ local function clamp_pitch(p)
   return math.max(-(lim.depress or 0), math.min(lim.elevate or 0, p))
 end
 
-local function status_payload()
+local function status_payload(extra)
   local pitch = periph.getPitch and periph.getPitch() or 0
   local yaw   = periph.getYaw and periph.getYaw() or 0
   local run   = periph.isRunning and periph.isRunning() or false
-  return { type="CANNON_STATUS", run=run, pitch=pitch, yaw=yaw, ts=U.now_ms() }
+  local st = { type="CANNON_STATUS", run=run, pitch=pitch, yaw=yaw, ts=U.now_ms() }
+  if extra then for k,v in pairs(extra) do st[k]=v end end
+  return st
+end
+
+local function aim_to(yaw, pitch)
+  if not caps.aim_support then return false, "no_aim_support" end
+  local y = (tonumber(yaw) or 0) % 360
+  local p = clamp_pitch(tonumber(pitch) or 0)
+  if periph.setYaw then periph.setYaw(y) end
+  if periph.setPitch then periph.setPitch(p) end
+  return true
 end
 
 local function handle_fire(args)
-  local now = U.now_ms()
+  local now_ms = U.now_ms()
   local ttl = args.ttl_ms or 10000
-  local when = args.when_ms or now
-  if now > when + ttl then return false, "ttl_expired" end
-  local since = now - last_fire_ms
+  local when = args.when_ms or now_ms
+  if now_ms > when + ttl then return false, "ttl_expired" end
+  local since = now_ms - last_fire_ms
   if since < MIN_COOLDOWN then return false, "cooldown" end
   if periph.isRunning and not periph.isRunning() and periph.assemble then periph.assemble() end
-  if args.aim and caps.aim_support then
-    local p = clamp_pitch(tonumber(args.aim.pitch or 0))
-    local y = tonumber(args.aim.yaw or 0) % 360
-    if periph.setYaw then periph.setYaw(y) end
-    if periph.setPitch then periph.setPitch(p) end
-  end
-  if when > now then sleep((when - now)/1000) end
+  if args.aim and caps.aim_support then aim_to(args.aim.yaw, args.aim.pitch) end
+  if when > now_ms then sleep((when - now_ms)/1000) end
   local rounds = math.max(1, tonumber(args.rounds or 1))
-  for i=1, rounds do
-    if periph.fire then periph.fire() end
-    if rounds > 1 then sleep(0.2) end
-  end
+  for i=1, rounds do if periph.fire then periph.fire() end; if rounds>1 then sleep(0.2) end end
   last_fire_ms = U.now_ms()
   return true
 end
 
--- Use Common.session/Common.channel filled by onboarding
 local session, ch = Common.session, Common.channel
 local modem = peripheral.find("modem")
 
@@ -89,11 +91,12 @@ while true do
         modem.transmit(ch, ch, Net.wrap(session, status_payload(), { dev=os.getComputerID() }))
       elseif inner.type == "LOG" then
         print("[Worker] LOG from master: "..tostring(inner.msg))
-        -- optional ack
+      elseif inner.type == "AIM" then
+        local okA, aErr = aim_to(inner.aim and inner.aim.yaw, inner.aim and inner.aim.pitch)
+        modem.transmit(ch, ch, Net.wrap(session, status_payload({ result = okA and "ok" or ("error:"..tostring(aErr)) }), { dev=os.getComputerID() }))
       elseif inner.type == "FIRE" then
-        local ok, ferr = handle_fire(inner)
-        local st = status_payload(); st.result = ok and "ok" or ("error:"..tostring(ferr))
-        modem.transmit(ch, ch, Net.wrap(session, st, { dev=os.getComputerID() }))
+        local okF, fErr = handle_fire(inner)
+        modem.transmit(ch, ch, Net.wrap(session, status_payload({ result = okF and "ok" or ("error:"..tostring(fErr)) }), { dev=os.getComputerID() }))
       elseif inner.type == "SHUTDOWN" then
         print("[Worker] SHUTDOWN received."); break
       end

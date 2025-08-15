@@ -144,18 +144,23 @@ function M.send_command(dev_id, inner_tbl)
   return true
 end
 
-function M.ping_worker(dev_id)   return M.send_command(dev_id, { type="PING",   ts=now() }) end
-function M.status_worker(dev_id) return M.send_command(dev_id, { type="STATUS", ts=now() }) end
+function M.ping_worker(dev_id)     return M.send_command(dev_id, { type="PING",   ts=now() }) end
+function M.status_worker(dev_id)   return M.send_command(dev_id, { type="STATUS", ts=now() }) end
 function M.log_worker(dev_id, text)
   return M.send_command(dev_id, { type="LOG", msg=tostring(text), ts=now() })
 end
 function M.fire_worker(dev_id, args)
-  -- Minimal test: rounds=1 by default
   local fire = { type="FIRE", rounds=(args and args.rounds) or 1, ts=now() }
-  if args and args.aim then fire.aim = args.aim end
-  if args and args.ttl_ms then fire.ttl_ms = args.ttl_ms end
+  if args and args.aim     then fire.aim = args.aim end
+  if args and args.ttl_ms  then fire.ttl_ms = args.ttl_ms end
   if args and args.when_ms then fire.when_ms = args.when_ms end
   return M.send_command(dev_id, fire)
+end
+function M.aim_worker(dev_id, yaw, pitch, opts)
+  local aim = { type="AIM", aim={ yaw=tonumber(yaw), pitch=tonumber(pitch) }, ts=now() }
+  if opts and opts.ttl_ms  then aim.ttl_ms  = opts.ttl_ms end
+  if opts and opts.when_ms then aim.when_ms = opts.when_ms end
+  return M.send_command(dev_id, aim)
 end
 
 local function push_pending(hello)
@@ -179,11 +184,8 @@ end
 function M.deny_index(i, reason)
   local rec = M.pending[i]; if not rec then return false, "no_pending" end
   local sess = M.sessions[rec.hello.device_id]
-  if sess then
-    send_on(Net.wrap(sess, { type="JOIN_WELCOME", accepted=false, reason=reason or "denied" }, { dev=rec.hello.device_id }))
-  else
-    send_on({ type="JOIN_WELCOME", accepted=false, reason=reason or "denied" })
-  end
+  if sess then send_on(Net.wrap(sess, { type="JOIN_WELCOME", accepted=false, reason=reason or "denied" }, { dev=rec.hello.device_id }))
+  else send_on({ type="JOIN_WELCOME", accepted=false, reason=reason or "denied" }) end
   table.remove(M.pending, i)
   Log.info("system", ("Denied join: %s"):format(rec.id))
   return true
@@ -192,11 +194,8 @@ end
 local function handle_join_hello(msg)
   if not M.pairing_active or not M.port then return end
   local dev_id = msg.device_id or -1
-
   local q = M.quarantine[dev_id]
-  if q and q > now() then
-    send_on({ type="JOIN_DENY", reason="quarantine", until_ms=q }); return
-  end
+  if q and q > now() then send_on({ type="JOIN_DENY", reason="quarantine", until_ms=q }); return end
 
   local ok = HS.verify_join_hello(msg, M.code)
   if not ok then
@@ -267,14 +266,15 @@ return {
   run = M.run,
   start_pairing_on_port = M.start_pairing_on_port,
   stop_pairing = M.stop_pairing,
-  get_active_code = function() return M.get_active_code() end,
-  get_active_port = function() return M.get_active_port() end,
-  get_pending = function() return M.get_pending() end,
+  get_active_code = function() return M.pairing_active and M.code or nil end,
+  get_active_port = function() return M.pairing_active and M.port or nil end,
+  get_pending = function() return M.pending end,
   approve_index = M.approve_index,
   deny_index = M.deny_index,
   get_workers = M.get_workers,
   ping_worker = M.ping_worker,
   status_worker = M.status_worker,
   log_worker = M.log_worker,
-  fire_worker = M.fire_worker
+  fire_worker = M.fire_worker,
+  aim_worker = M.aim_worker
 }
