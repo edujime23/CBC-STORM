@@ -1,9 +1,14 @@
 -- /storm/encryption/handshake.lua
+-- Pairing handshake (no ECDH yet):
+--  1) Worker -> Master: JOIN_HELLO {dev_id, kind, nonceW, mac=HMAC(code, dev_id|nonceW)}
+--  2) Master -> Worker: WELCOME_SEED {nonceM, mac=HMAC(code, dev_id|nonceW|nonceM)}
+--  3) Both derive session = HKDF(code, nonceW||nonceM); further messages ENC via NetSec.
+
 local U = require("/storm/lib/utils")
 local Crypto = require("/storm/encryption/crypto")
 
 local DEBUG = true
-local M = {}
+local HS = {}
 
 local function poor_hash(s)
   local h = 0
@@ -18,41 +23,76 @@ local function uuid()
   return table.concat(t)
 end
 
-function M.build_join_hello(opts)
+local function code_bytes(code, dev_id)
+  -- derive bytes from code+dev_id to avoid raw 4-digit as KDF IKM
+  return Crypto.sha256(tostring(code) .. ":" .. tostring(dev_id))
+end
+
+function HS.build_join_hello(opts)
+  local dev_id = opts.device_id or os.getComputerID()
+  local node_kind = opts.node_kind or "worker"
+  local nonceW = Crypto.random(16)
+  local key = code_bytes(opts.code, dev_id)
+  local mac = Crypto.hmac_sha256(key, tostring(dev_id) .. "|" .. nonceW)
   local hello = {
     type = "JOIN_HELLO",
-    node_kind = opts.node_kind or "worker",
-    device_id = opts.device_id or os.getComputerID(),
-    nonce = poor_hash(uuid() .. tostring(os.clock())),
-    code = opts.code,
+    node_kind = node_kind,
+    device_id = dev_id,
+    nonceW = nonceW,
+    mac = mac,
     caps = opts.caps or {},
     ts = U.now_ms()
   }
   if DEBUG then
-    print(("[Handshake] build_join_hello dev=%s kind=%s code=%s ts=%s")
-      :format(tostring(hello.device_id), tostring(hello.node_kind), tostring(hello.code), tostring(hello.ts)))
+    print(("[Handshake] HELLO dev=%s kind=%s ts=%s"):format(tostring(dev_id), tostring(node_kind), tostring(hello.ts)))
   end
   return hello
 end
 
-function M.verify_join_hello(hello, active_code)
+function HS.verify_join_hello(hello, active_code)
   if type(hello) ~= "table" or hello.type ~= "JOIN_HELLO" then
-    if DEBUG then print("[Handshake] verify: bad_msg") end
+    if DEBUG then print("[Handshake] verify_hello: bad_msg") end
     return false, "bad_msg"
   end
+  if not active_code then return false, "no_code" end
+  local key = code_bytes(active_code, hello.device_id)
+  local expect = Crypto.hmac_sha256(key, tostring(hello.device_id) .. "|" .. (hello.nonceW or ""))
+  local ok = (expect == hello.mac)
   if DEBUG then
-    print(("[Handshake] verify: dev=%s kind=%s code=%s active=%s")
-      :format(tostring(hello.device_id), tostring(hello.node_kind), tostring(hello.code), tostring(active_code)))
+    print(("[Handshake] verify_hello dev=%s ok=%s"):format(tostring(hello.device_id), tostring(ok)))
   end
-  if not active_code or tostring(hello.code) ~= tostring(active_code) then
-    if DEBUG then print("[Handshake] verify: bad_code") end
-    return false, "bad_code"
-  end
-  if DEBUG then print("[Handshake] verify: ok") end
+  if not ok then return false, "bad_code" end
   return true
 end
 
-function M.issue_lease(worker_info, ttl_ms, policy)
+function HS.build_welcome_seed(dev_id, code, nonceW)
+  local nonceM = Crypto.random(16)
+  local key = code_bytes(code, dev_id)
+  local mac = Crypto.hmac_sha256(key, tostring(dev_id) .. "|" .. nonceW .. "|" .. nonceM)
+  return {
+    type="WELCOME_SEED",
+    device_id = dev_id,
+    nonceM = nonceM,
+    mac = mac,
+    ts = U.now_ms()
+  }
+end
+
+function HS.verify_welcome_seed(seed, code, nonceW)
+  if type(seed)~="table" or seed.type~="WELCOME_SEED" then return false, "bad_msg" end
+  local key = code_bytes(code, seed.device_id)
+  local expect = Crypto.hmac_sha256(key, tostring(seed.device_id) .. "|" .. nonceW .. "|" .. seed.nonceM)
+  if expect ~= seed.mac then return false, "bad_mac" end
+  return true
+end
+
+function HS.derive_pair_session(code, dev_id, nonceW, nonceM, NetSec)
+  local key = code_bytes(code, dev_id)
+  local sess = NetSec.derive_session(key, nonceW, nonceM)
+  return sess
+end
+
+function HS.issue_lease(worker_info, ttl_ms, policy)
   local lease = {
     lease_id = uuid(),
     node_id = worker_info.device_id or 0,
@@ -70,4 +110,4 @@ function M.issue_lease(worker_info, ttl_ms, policy)
   return lease
 end
 
-return M
+return HS

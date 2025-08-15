@@ -1,10 +1,11 @@
 -- /storm/core/join_service.lua
--- Secure pairing (operator-chosen port, no discovery) + heavy debug + PAIR_READY ping.
+-- Secure pairing (operator-chosen port, no discovery) + debug + PAIR_READY ping + encrypted ACK/WELCOME.
 
-local U  = require("/storm/lib/utils")
-local C  = require("/storm/lib/config_loader")
-local L  = require("/storm/lib/logger")
-local HS = require("/storm/encryption/handshake") -- no crypto used; only code check
+local U   = require("/storm/lib/utils")
+local Cfg = require("/storm/lib/config_loader")
+local Log = require("/storm/lib/logger")
+local HS  = require("/storm/encryption/handshake")
+local Net = require("/storm/encryption/netsec")
 
 local DEBUG = true
 
@@ -18,12 +19,13 @@ local M = {
   attempts         = {},
   quarantine       = {},
   _modem           = nil,
-  _last_ready_ms   = 0
+  _last_ready_ms   = 0,
+  sessions         = {}   -- sessions[device_id] = session (k_enc,k_mac,salt4,seqs)
 }
 
-local function cfg_attempt_limit() return (C.security and C.security.pairing_attempt_limit) or 4 end
-local function cfg_quarantine_ttl() return (C.security and C.security.quarantine_ttl_ms) or (15*60*1000) end
-local function cfg_pairing_window() return (C.system and C.system.join_psk_window_s and C.system.join_psk_window_s*1000) or (5*60*1000) end
+local function cfg_attempt_limit() return (Cfg.security and Cfg.security.pairing_attempt_limit) or 4 end
+local function cfg_quarantine_ttl() return (Cfg.security and Cfg.security.quarantine_ttl_ms) or (15*60*1000) end
+local function cfg_pairing_window() return (Cfg.system and Cfg.system.join_psk_window_s and Cfg.system.join_psk_window_s*1000) or (5*60*1000) end
 local function now() return U.now_ms() end
 
 local function modem_or_error()
@@ -61,6 +63,7 @@ local function send_on(tbl)
   local m = modem_or_error()
   if not M.port then return end
   if DEBUG then print(("[JoinService] TX on %d: %s"):format(M.port, type(tbl)=="table" and (tbl.type or "table") or tostring(tbl))) end
+  Log.info("pairing", "TX on "..tostring(M.port)..": "..(type(tbl)=="table" and (tbl.type or "table") or type(tbl)))
   m.transmit(M.port, M.port, tbl)
 end
 
@@ -120,10 +123,10 @@ function M.start_pairing_interactive()
   M.code    = generate_code4()
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
-  M.attempts, M.quarantine = {}, {}
+  M.attempts, M.quarantine, M.sessions = {}, {}, {}
   M._last_ready_ms = 0
 
-  L.info("system", ("Pairing started on port %d with code %s"):format(M.port, M.code))
+  Log.info("system", ("Pairing started on port %d with code %s"):format(M.port, M.code))
   print(("[JoinService] Pairing ARMED: port=%d code=%s"):format(M.port, M.code))
 end
 
@@ -134,7 +137,7 @@ function M.stop_pairing()
   M.expires = 0
   M.code = ""
   M.port = nil
-  L.info("system", "Pairing window closed")
+  Log.info("system", "Pairing window closed")
 end
 
 function M.get_active_code()  return M.pairing_active and M.code or nil end
@@ -145,35 +148,48 @@ local function push_pending(hello)
   local id = ("%d-%06d"):format(hello.device_id or 0, math.random(100000, 999999))
   local rec = { id = id, hello = hello, ch = M.port, side = "modem", ts = now() }
   table.insert(M.pending, rec)
-  L.info("system", ("Join request queued: %s (%s)"):format(id, tostring(hello.node_kind)))
+  Log.info("system", ("Join request queued: %s (%s)"):format(id, tostring(hello.node_kind)))
 end
 
 function M.approve_index(i)
   local rec = M.pending[i]
   if not rec then return false, "no_pending" end
-  local lease = HS.issue_lease(rec.hello, C.security.lease_ttl_ms, {
+  local sess = M.sessions[rec.hello.device_id]
+  if not sess then
+    Log.warn("pairing", "No session for approved device; cannot send WELCOME")
+    return false, "no_session"
+  end
+  local lease = HS.issue_lease(rec.hello, Cfg.security.lease_ttl_ms, {
     caps = { can_fire = true, can_aim = true },
-    min_cooldown_ms = (C.security and C.security.min_cooldown_ms) or 3000
+    min_cooldown_ms = (Cfg.security and Cfg.security.min_cooldown_ms) or 3000
   })
-  send_on({
+  local frame = Net.wrap(sess, {
     type       = "JOIN_WELCOME",
     accepted   = true,
-    cluster_id = C.system.cluster_id,
+    cluster_id = Cfg.system.cluster_id,
     lease      = lease,
     policy     = lease.policy
-  })
+  }, { dev = rec.hello.device_id })
+  send_on(frame)
   table.insert(M.approved, { id = rec.id, lease = lease, hello = rec.hello, ts = now() })
   table.remove(M.pending, i)
-  L.info("system", ("Approved join: %s"):format(rec.id))
+  Log.info("system", ("Approved join: %s"):format(rec.id))
   return true
 end
 
 function M.deny_index(i, reason)
   local rec = M.pending[i]
   if not rec then return false, "no_pending" end
-  send_on({ type = "JOIN_WELCOME", accepted = false, reason = reason or "denied" })
+  local sess = M.sessions[rec.hello.device_id]
+  if sess then
+    local frame = Net.wrap(sess, { type="JOIN_WELCOME", accepted=false, reason=reason or "denied" }, { dev = rec.hello.device_id })
+    send_on(frame)
+  else
+    -- fallback cleartext deny (pre-session)
+    send_on({ type = "JOIN_WELCOME", accepted = false, reason = reason or "denied" })
+  end
   table.remove(M.pending, i)
-  L.info("system", ("Denied join: %s"):format(rec.id))
+  Log.info("system", ("Denied join: %s"):format(rec.id))
   return true
 end
 
@@ -181,17 +197,17 @@ local function handle_join_hello(msg)
   if not M.pairing_active or not M.port then return end
 
   local dev_id = msg.device_id or -1
-  if DEBUG then print(("[JoinService] JOIN_HELLO from dev=%s code=%s"):format(tostring(dev_id), tostring(msg.code))) end
+  if DEBUG then print(("[JoinService] JOIN_HELLO from dev=%s"):format(tostring(dev_id))) end
 
   local q = M.quarantine[dev_id]
   if q and q > now() then
     send_on({ type = "JOIN_DENY", reason = "quarantine", until_ms = q })
-    L.warn("system", ("Quarantined device %s attempted pairing"):format(tostring(dev_id)))
+    Log.warn("system", ("Quarantined device %s attempted pairing"):format(tostring(dev_id)))
     return
   end
 
-  local ok_code = (type(msg.code) == "string" or type(msg.code) == "number") and (tostring(msg.code) == M.code)
-  if not ok_code then
+  local ok, err = HS.verify_join_hello(msg, M.code)
+  if not ok then
     local attempts = (M.attempts[dev_id] or 0) + 1
     M.attempts[dev_id] = attempts
     local left = math.max(0, cfg_attempt_limit() - attempts)
@@ -199,17 +215,26 @@ local function handle_join_hello(msg)
       local until_ms = now() + cfg_quarantine_ttl()
       M.quarantine[dev_id] = until_ms
       send_on({ type = "JOIN_DENY", reason = "attempts_exceeded", until_ms = until_ms })
-      L.warn("system", ("Device %s exceeded pairing attempts; quarantined"):format(tostring(dev_id)))
+      Log.warn("system", ("Device %s exceeded pairing attempts; quarantined"):format(tostring(dev_id)))
     else
       send_on({ type = "JOIN_DENY", reason = "bad_code", attempts_left = left })
-      L.warn("system", ("Bad code from device %s; left=%d"):format(tostring(dev_id), left))
+      Log.warn("system", ("Bad code from device %s; left=%d"):format(tostring(dev_id), left))
     end
     return
   end
 
+  -- Build WELCOME_SEED and create session
+  local seed = HS.build_welcome_seed(dev_id, M.code, msg.nonceW)
+  send_on(seed)
+
+  -- Derive session
+  local sess = HS.derive_pair_session(M.code, dev_id, msg.nonceW, seed.nonceM, Net)
+  M.sessions[dev_id] = sess
+
+  -- Push to pending and send encrypted ACK
   push_pending(msg)
-  print(("[JoinService] JOIN_HELLO accepted from device %s"):format(tostring(msg.device_id)))
-  send_on({ type = "JOIN_ACK", queued = true })
+  local ack = Net.wrap(sess, { type="JOIN_ACK", queued=true }, { dev = dev_id })
+  send_on(ack)
 end
 
 local function handle_modem_message(side, channel, replyChannel, msg, dist)
@@ -218,11 +243,14 @@ local function handle_modem_message(side, channel, replyChannel, msg, dist)
     print(("[JoinService] RX side=%s ch=%s reply=%s dist=%s type=%s active=%s port=%s")
       :format(tostring(side), tostring(channel), tostring(replyChannel), tostring(dist), tostring(ty), tostring(M.pairing_active), tostring(M.port)))
   end
+  Log.info("pairing", ("RX ch=%s type=%s"):format(tostring(channel), (type(msg)=="table" and msg.type) or type(msg)))
   if not M.pairing_active then return end
   if not M.port or channel ~= M.port then return end
   if type(msg) ~= "table" then return end
   if msg.type == "JOIN_HELLO" then
     handle_join_hello(msg)
+  else
+    -- Encrypted frames may arrive here too; ignore until approved (only ACK+WELCOME are used).
   end
 end
 
@@ -236,14 +264,13 @@ function M.run()
       elseif ev == "modem_message" then handle_modem_message(p1, p2, p3, p4, p5) end
     end
 
-    -- Send a small READY ping once per second on the chosen port (for connectivity debug only)
     if M.pairing_active and M.port and (now() - (M._last_ready_ms or 0) > 1000) then
       send_on({ type = "PAIR_READY", port = M.port })
       M._last_ready_ms = now()
     end
 
     if M.pairing_active and now() > (M.expires or 0) then
-      L.info("system", "Pairing window expired")
+      Log.info("system", "Pairing window expired")
       M.stop_pairing()
     end
   end

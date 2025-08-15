@@ -85,7 +85,7 @@ function M.run()
 
   local function key_loop()
     while true do
-      local _, k = os.pullEvent("key") -- only key events; don't consume modem_message
+      local _, k = os.pullEvent("key") -- only key events; never modem_message
       if k == keys.p then
         M.suspend_ticks = true
         term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")

@@ -1,29 +1,226 @@
--- /storm/lib/crypto.lua
--- Placeholder crypto interface. Will be replaced with real X25519/Ed25519/ChaCha20-Poly1305/HKDF.
-local M = {}
+-- /storm/encryption/crypto.lua
+-- Pure-Lua crypto primitives for CBC-STORM:
+--  - SHA-256
+--  - HMAC-SHA256
+--  - HKDF-SHA256
+--  - ChaCha20 stream (RFC 7539 core, 96-bit nonce, CTR)
+--  - Helpers (random, hex, pack/unpack, uint ops)
+-- Encrypt-then-MAC is implemented in netsec.lua (ChaCha20-CTR + HMAC-SHA256)
 
-function M.random(n)
+local bit32 = bit32
+local band, bor, bxor = bit32.band, bit32.bor, bit32.bxor
+local rshift, lshift = bit32.rshift, bit32.lshift
+local rol = bit32.lrotate
+
+local Crypto = {}
+
+-- Random: basic; seed externally elsewhere if needed
+function Crypto.random(n)
   local s = ""
   for i = 1, (n or 32) do s = s .. string.char(math.random(0, 255)) end
   return s
 end
 
-function M.sha256(s) return s end
-function M.hmac_sha256(k, m) return m end
-function M.hkdf_extract(salt, ikm) return (salt or "") .. (ikm or "") end
-function M.hkdf_expand(prk, info, len) return (prk or "") .. (info or "") end
-
--- AEAD stubs
-function M.aead_encrypt(key, nonce, aad, plaintext)
-  return plaintext, string.rep("\0", 16)
-end
-function M.aead_decrypt(key, nonce, aad, ciphertext, tag)
-  return ciphertext, true
+-- Helpers
+local function tobytes_le32(x)
+  return string.char(
+    band(x,255),
+    band(rshift(x,8),255),
+    band(rshift(x,16),255),
+    band(rshift(x,24),255)
+  )
 end
 
-function M.x25519_keypair() return { sk = "sk", pk = "pk" } end
-function M.ed25519_keypair() return { sk = "sk", pk = "pk" } end
-function M.ed25519_sign(sk, m) return "sig" end
-function M.ed25519_verify(pk, m, sig) return true end
+local function frombytes_le32(s, i)
+  local b1 = string.byte(s,i) or 0
+  local b2 = string.byte(s,i+1) or 0
+  local b3 = string.byte(s,i+2) or 0
+  local b4 = string.byte(s,i+3) or 0
+  return bor(b1, lshift(b2,8), lshift(b3,16), lshift(b4,24))
+end
 
-return M
+function Crypto.hex(s)
+  local t = {}
+  for i=1,#s do t[#t+1] = string.format("%02x", s:byte(i)) end
+  return table.concat(t)
+end
+
+-- SHA-256 (pure Lua, uses bit32)
+do
+  local H0 = {
+    0x6A09E667,0xBB67AE85,0x3C6EF372,0xA54FF53A,
+    0x510E527F,0x9B05688C,0x1F83D9AB,0x5BE0CD19
+  }
+  local K = {
+    0x428A2F98,0x71374491,0xB5C0FBCF,0xE9B5DBA5,0x3956C25B,0x59F111F1,0x923F82A4,0xAB1C5ED5,
+    0xD807AA98,0x12835B01,0x243185BE,0x550C7DC3,0x72BE5D74,0x80DEB1FE,0x9BDC06A7,0xC19BF174,
+    0xE49B69C1,0xEFBE4786,0x0FC19DC6,0x240CA1CC,0x2DE92C6F,0x4A7484AA,0x5CB0A9DC,0x76F988DA,
+    0x983E5152,0xA831C66D,0xB00327C8,0xBF597FC7,0xC6E00BF3,0xD5A79147,0x06CA6351,0x14292967,
+    0x27B70A85,0x2E1B2138,0x4D2C6DFC,0x53380D13,0x650A7354,0x766A0ABB,0x81C2C92E,0x92722C85,
+    0xA2BFE8A1,0xA81A664B,0xC24B8B70,0xC76C51A3,0xD192E819,0xD6990624,0xF40E3585,0x106AA070,
+    0x19A4C116,0x1E376C08,0x2748774C,0x34B0BCB5,0x391C0CB3,0x4ED8AA4A,0x5B9CCA4F,0x682E6FF3,
+    0x748F82EE,0x78A5636F,0x84C87814,0x8CC70208,0x90BEFFFA,0xA4506CEB,0xBEF9A3F7,0xC67178F2
+  }
+  local function ror(x,n) return rshift(x,n) + lshift(x,32-n) % 2^32 end
+  local function Ch(x,y,z) return bxor(band(x,y), band(bxor(x,0xffffffff), z)) end
+  local function Maj(x,y,z) return bxor(band(x,y), band(x,z), band(y,z)) end
+  local function Sigma0(x) return bxor(rol(x,30), rol(x,19), rol(x,10)) end
+  local function Sigma1(x) return bxor(rol(x,26), rol(x,21), rol(x,7)) end
+  local function sigma0(x) return bxor(rol(x,25), rol(x,14), rshift(x,3)) end
+  local function sigma1(x) return bxor(rol(x,15), rol(x,13), rshift(x,10)) end
+
+  local function preprocess(msg)
+    local ml = #msg * 8
+    msg = msg..string.char(0x80)
+    local pad = (56 - (#msg % 64)) % 64
+    msg = msg .. string.rep("\0", pad)
+    local hi = 0; local lo = ml
+    local function put64(n) -- big-endian
+      local t = {}
+      for i=7,0,-1 do t[#t+1] = string.char( band(rshift(n, i*8), 0xff ) ) end
+      return table.concat(t)
+    end
+    local hi32 = math.floor(ml / 2^32)
+    local lo32 = ml % 2^32
+    local out = { msg,
+      string.char(
+        band(rshift(hi32,24),255), band(rshift(hi32,16),255), band(rshift(hi32,8),255), band(hi32,255),
+        band(rshift(lo32,24),255), band(rshift(lo32,16),255), band(rshift(lo32,8),255), band(lo32,255)
+      )
+    }
+    return table.concat(out)
+  end
+
+  function Crypto.sha256(msg)
+    local H = {table.unpack(H0)}
+    msg = preprocess(msg)
+    for i=1,#msg,64 do
+      local w = {}
+      for j=0,15 do
+        local a = string.byte(msg, i+j*4+1) or 0
+        local b = string.byte(msg, i+j*4+2) or 0
+        local c = string.byte(msg, i+j*4+3) or 0
+        local d = string.byte(msg, i+j*4+4) or 0
+        w[j+1] = bor(lshift(a,24), lshift(b,16), lshift(c,8), d)
+      end
+      for j=17,64 do
+        local v = (w[j-16] + sigma0(w[j-15]) + w[j-7] + sigma1(w[j-2])) % 2^32
+        w[j] = v
+      end
+      local a,b,c,d,e,f,g,h = H[1],H[2],H[3],H[4],H[5],H[6],H[7],H[8]
+      for j=1,64 do
+        local T1 = (h + Sigma1(e) + Ch(e,f,g) + K[j] + w[j]) % 2^32
+        local T2 = (Sigma0(a) + Maj(a,b,c)) % 2^32
+        h = g; g = f; f = e; e = (d + T1) % 2^32
+        d = c; c = b; b = a; a = (T1 + T2) % 2^32
+      end
+      H[1] = (H[1] + a) % 2^32
+      H[2] = (H[2] + b) % 2^32
+      H[3] = (H[3] + c) % 2^32
+      H[4] = (H[4] + d) % 2^32
+      H[5] = (H[5] + e) % 2^32
+      H[6] = (H[6] + f) % 2^32
+      H[7] = (H[7] + g) % 2^32
+      H[8] = (H[8] + h) % 2^32
+    end
+    local out = {}
+    for i=1,8 do
+      out[#out+1] = string.char(
+        band(rshift(H[i],24),255), band(rshift(H[i],16),255), band(rshift(H[i],8),255), band(H[i],255)
+      )
+    end
+    return table.concat(out)
+  end
+end
+
+function Crypto.hmac_sha256(key, msg)
+  local block = 64
+  if #key > block then key = Crypto.sha256(key) end
+  key = key .. string.rep("\0", block - #key)
+  local o_key_pad = key:gsub(".", function(c) return string.char(bxor(string.byte(c), 0x5c)) end)
+  local i_key_pad = key:gsub(".", function(c) return string.char(bxor(string.byte(c), 0x36)) end)
+  return Crypto.sha256(o_key_pad .. Crypto.sha256(i_key_pad .. msg))
+end
+
+function Crypto.hkdf_extract(salt, ikm)
+  salt = salt or string.rep("\0", 32)
+  return Crypto.hmac_sha256(salt, ikm)
+end
+
+function Crypto.hkdf_expand(prk, info, len)
+  local t, ok = "", ""
+  local out = {}
+  local block = 0
+  while #t < len do
+    block = block + 1
+    ok = Crypto.hmac_sha256(prk, ok .. info .. string.char(block))
+    out[#out+1] = ok
+    t = table.concat(out)
+  end
+  return string.sub(t, 1, len)
+end
+
+-- ChaCha20 stream (RFC 7539 core), 96-bit nonce, 32-bit counter
+local SIGMA = { 0x61707865,0x3320646e,0x79622d32,0x6b206574 }
+
+local function quarter(a,b,c,d)
+  a = (a + b) % 2^32; d = bxor(d, a); d = rol(d,16)
+  c = (c + d) % 2^32; b = bxor(b, c); b = rol(b,12)
+  a = (a + b) % 2^32; d = bxor(d, a); d = rol(d,8)
+  c = (c + d) % 2^32; b = bxor(b, c); b = rol(b,7)
+  return a,b,c,d
+end
+
+local function chacha20_block(key, counter, nonce)
+  -- key: 32 bytes; nonce: 12 bytes
+  local k = {}
+  for i=1,8 do k[i] = frombytes_le32(key, (i-1)*4+1) end
+  local n1 = counter
+  local n2 = frombytes_le32(nonce,1)
+  local n3 = frombytes_le32(nonce,5)
+  local n4 = frombytes_le32(nonce,9)
+  local state = {
+    SIGMA[1],SIGMA[2],SIGMA[3],SIGMA[4],
+    k[1],k[2],k[3],k[4],k[5],k[6],k[7],k[8],
+    n1,n2,n3,n4
+  }
+  local working = {table.unpack(state)}
+  for _=1,10 do
+    working[1],working[5],working[9],working[13] = quarter(working[1],working[5],working[9],working[13])
+    working[2],working[6],working[10],working[14] = quarter(working[2],working[6],working[10],working[14])
+    working[3],working[7],working[11],working[15] = quarter(working[3],working[7],working[11],working[15])
+    working[4],working[8],working[12],working[16] = quarter(working[4],working[8],working[12],working[16])
+    working[1],working[6],working[11],working[16] = quarter(working[1],working[6],working[11],working[16])
+    working[2],working[7],working[12],working[13] = quarter(working[2],working[7],working[12],working[13])
+    working[3],working[8],working[9],working[14] = quarter(working[3],working[8],working[9],working[14])
+    working[4],working[5],working[10],working[15] = quarter(working[4],working[5],working[10],working[15])
+  end
+  local out = {}
+  for i=1,16 do
+    local v = (working[i] + state[i]) % 2^32
+    out[#out+1] = tobytes_le32(v)
+  end
+  return table.concat(out)
+end
+
+function Crypto.chacha20_xor(key, nonce, counter, plaintext)
+  local out = {}
+  local off = 1
+  local ctr = counter or 1
+  while off <= #plaintext do
+    local ks = chacha20_block(key, ctr, nonce)
+    ctr = (ctr + 1) % 2^32
+    local block = string.sub(ks, 1, math.min(64, #plaintext - off + 1))
+    local chunk = {}
+    for i=1,#block do
+      local p = plaintext:byte(off + i - 1)
+      local k = block:byte(i)
+      chunk[i] = string.char(bxor(p, k))
+    end
+    out[#out+1] = table.concat(chunk)
+    off = off + #block
+  end
+  return table.concat(out)
+end
+
+return Crypto

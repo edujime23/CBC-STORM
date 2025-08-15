@@ -1,8 +1,7 @@
 -- /storm/worker_payloads/worker_cannon.lua
--- Entry point: Cannon Worker — detect peripheral, pair, and get a lease (next: secure channel)
+-- Cannon Worker entrypoint: detect cannon, pair, then await controller commands (later).
 
 local Common = require("/storm/worker_payloads/worker_common")
-local U = require("/storm/lib/utils")
 
 print("CBC-STORM v4.0 — Cannon Worker")
 
@@ -44,7 +43,7 @@ print("Detected cannon. Aim support:", caps.aim_support and "yes" or "no")
 Common.init()
 local join_info = Common.find_pairing()
 if not join_info then
-  print("No pairing beacon found (stealth or timeout).")
+  print("Pairing cancelled.")
   return
 end
 
@@ -54,4 +53,4 @@ if not ok then
   return
 end
 
-print("Ready to receive lease-driven commands (secure channel next phase).")
+print("Ready to receive lease-driven commands (encrypted session established).")

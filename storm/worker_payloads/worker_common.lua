@@ -1,9 +1,10 @@
 -- /storm/worker_payloads/worker_common.lua
--- Worker pairing: ask for port and 4-digit code, no discovery, heavy debug + pre-listen.
+-- Worker pairing: ask for port & 4-digit code, pre-listen for PAIR_READY, encrypted ACK/WELCOME.
 
-local U  = require("/storm/lib/utils")
-local L  = require("/storm/lib/logger")
-local HS = require("/storm/encryption/handshake")
+local U   = require("/storm/lib/utils")
+local Log = require("/storm/lib/logger")
+local HS  = require("/storm/encryption/handshake")
+local Net = require("/storm/encryption/netsec")
 
 local DEBUG = true
 
@@ -41,7 +42,7 @@ local function read_code4(prompt)
 end
 
 function M.init()
-  L.info("worker", "Init common worker")
+  Log.info("worker", "Init common worker")
   local m = peripheral.find("modem")
   if m and m.closeAll then pcall(function() m.closeAll() end) end
 end
@@ -62,7 +63,7 @@ function M.onboard(node_kind, caps, join_info)
   if not modem.isOpen(ch) then pcall(function() modem.open(ch) end) end
   print(("[Worker] isOpen(%d)=%s"):format(ch, tostring(modem.isOpen and modem.isOpen(ch) or false)))
 
-  -- Pre-listen for PAIR_READY to validate connectivity (1.5s)
+  -- Pre-listen for PAIR_READY (1.5s)
   local pre_t = os.startTimer(1.5)
   local saw_ready = false
   while true do
@@ -71,11 +72,11 @@ function M.onboard(node_kind, caps, join_info)
       break
     elseif ev == "modem_message" then
       local ty = (type(msg)=="table" and msg.type) or type(msg)
+      Log.info("pairing", ("PRE-RX ch=%s type=%s"):format(tostring(channel), tostring(ty)))
       if DEBUG then print(("[Worker] PRE-RX ch=%s type=%s"):format(tostring(channel), tostring(ty))) end
       if channel == ch and type(msg)=="table" and msg.type=="PAIR_READY" then
         print("[Worker] Master PAIR_READY seen. Link OK.")
         saw_ready = true
-        -- don't break; continue until timer to soak noise
       end
     end
   end
@@ -83,6 +84,7 @@ function M.onboard(node_kind, caps, join_info)
     print("[Worker] No PAIR_READY seen. Link may be out of range or master not armed.")
   end
 
+  -- Build HELLO with nonceW+MAC(code)
   local hello = HS.build_join_hello({
     node_kind = node_kind,
     device_id = os.getComputerID(),
@@ -90,56 +92,79 @@ function M.onboard(node_kind, caps, join_info)
     caps = caps or {}
   })
 
-  print(("[Worker] TX JOIN_HELLO on ch %d (dev=%s code=%s)"):format(ch, tostring(hello.device_id), tostring(hello.code)))
+  print(("[Worker] TX JOIN_HELLO on ch %d (dev=%s)"):format(ch, tostring(hello.device_id)))
   modem.transmit(ch, ch, hello)
 
-  -- Wait long enough for operator approval
+  -- Wait for WELCOME_SEED then derive session and expect encrypted ACK/WELCOME
+  local nonceW = hello.nonceW
+  local sess = nil
   local timer = os.startTimer(60)
+
   while true do
     local ev, side, channel, replyCh, msg, dist = os.pullEvent()
     if ev == "timer" and side == timer then
       if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
       return false, "timeout"
     elseif ev == "modem_message" then
-      if DEBUG then
-        local ty = (type(msg)=="table" and msg.type) or type(msg)
-        print(("[Worker] RX side=%s ch=%s reply=%s dist=%s type=%s"):format(tostring(side), tostring(channel), tostring(replyCh), tostring(dist), tostring(ty)))
-      end
-      if channel ~= ch then
-        if DEBUG then print(("[Worker] Ignoring message on ch %s (expected %s)"):format(tostring(channel), tostring(ch))) end
-      else
-        if type(msg) == "table" then
-          if msg.type == "JOIN_ACK" and msg.queued then
+      local ty = (type(msg)=="table" and msg.type) or type(msg)
+      if DEBUG then print(("[Worker] RX side=%s ch=%s reply=%s dist=%s type=%s"):format(tostring(side), tostring(channel), tostring(replyCh), tostring(dist), tostring(ty))) end
+      if channel ~= ch then goto continue end
+
+      if type(msg)=="table" and msg.type=="WELCOME_SEED" then
+        -- Verify mac and derive session
+        local ok, err = HS.verify_welcome_seed(msg, code4, nonceW)
+        if not ok then print("[Worker] Bad WELCOME_SEED MAC:"..tostring(err)); return false, "bad_seed" end
+        sess = HS.derive_pair_session(code4, os.getComputerID(), nonceW, msg.nonceM, Net)
+        print("[Worker] Session derived. Awaiting encrypted ACK/WELCOME...")
+
+      elseif type(msg)=="table" and msg.type=="ENC" then
+        -- Must have sess to decrypt
+        if not sess then goto continue end
+        local inner, err = Net.unwrap(sess, msg, { dev=os.getComputerID() })
+        if not inner then
+          if DEBUG then print("[Worker] ENC unwrap failed: "..tostring(err)) end
+        else
+          if inner.type=="JOIN_ACK" and inner.queued then
             print("[Worker] Master queued request for approval...")
             timer = os.startTimer(60)
-          elseif msg.type == "JOIN_DENY" then
-            if msg.reason == "quarantine" or msg.reason == "attempts_exceeded" then
+          elseif inner.type=="JOIN_WELCOME" then
+            if inner.accepted then
               if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-              return false, msg.reason
-            elseif msg.reason == "bad_code" then
-              print("Bad code. Attempts left: " .. tostring(msg.attempts_left or 0))
-              local c2 = read_code4("Enter 4-digit code (retry): ")
-              hello.code = c2
-              print("[Worker] Re-TX JOIN_HELLO with new code")
-              modem.transmit(ch, ch, hello)
-              timer = os.startTimer(60)
-            else
-              if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-              return false, "denied"
-            end
-          elseif msg.type == "JOIN_WELCOME" then
-            if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-            if msg.accepted then
-              M.lease = msg.lease
+              M.lease = inner.lease
               M.state = "ESTABLISHED"
               print("Paired. Lease: " .. tostring(M.lease.lease_id))
               return true
             else
-              return false, msg.reason or "denied"
+              if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+              return false, inner.reason or "denied"
             end
           end
         end
+
+      elseif type(msg)=="table" and msg.type=="JOIN_DENY" then
+        if msg.reason=="quarantine" or msg.reason=="attempts_exceeded" then
+          if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+          return false, msg.reason
+        elseif msg.reason=="bad_code" then
+          print("Bad code. Attempts left: "..tostring(msg.attempts_left or 0))
+          local c2 = read_code4("Enter 4-digit code (retry): ")
+          -- Re-HELLO with new code
+          hello = HS.build_join_hello({
+            node_kind = node_kind,
+            device_id = os.getComputerID(),
+            code = c2,
+            caps = caps or {}
+          })
+          nonceW = hello.nonceW
+          modem.transmit(ch, ch, hello)
+          timer = os.startTimer(60)
+        else
+          if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+          return false, "denied"
+        end
+
       end
+      ::continue::
     end
   end
 end

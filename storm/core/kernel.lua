@@ -1,11 +1,9 @@
 -- /storm/core/kernel.lua
--- Entry point: Controller — run UI and JoinService concurrently
-
+-- Controller entrypoint: UI and JoinService run concurrently.
 package.path = "/?.lua;/?/init.lua;" .. package.path
 
-local L = require("/storm/lib/logger")
+local UI   = require("/storm/modules/ui")
 local Join = require("/storm/core/join_service")
-local UI = require("/storm/modules/ui")
 
 print("CBC-STORM v4.0 — Controller")
 
