@@ -28,6 +28,7 @@ local function cfg_quarantine_ttl() return (Cfg.security and Cfg.security.quaran
 local function cfg_pairing_window() return (Cfg.system and Cfg.system.join_psk_window_s and Cfg.system.join_psk_window_s*1000) or (5*60*1000) end
 local function now() return U.now_ms() end
 
+-- Prefer wireless modem. If none, error (as requested).
 local function pick_wireless_modem()
   local names = peripheral.getNames()
   local first_modem = nil
@@ -42,12 +43,10 @@ local function pick_wireless_modem()
           if DEBUG then print(("[JoinService] Selected wireless modem: %s"):format(name)) end
           return m
         end
-        -- remember first modem (non-wireless) just for info
         if not first_modem then first_modem = { obj=m, name=name } end
       end
     end
   end
-  -- No wireless modem found: error exactly as requested
   if first_modem then
     error(("No wireless modem found. Found only wired modem '%s'. Attach a wireless/ender modem and retry."):format(first_modem.name))
   else
@@ -86,20 +85,7 @@ local function send_on(tbl)
   m.transmit(M.port, M.port, tbl)
 end
 
-local function read_number(prompt, minv, maxv)
-  while true do
-    term.setCursorPos(1, 4); term.clearLine(); io.write(prompt)
-    local s = read()
-    local n = tonumber(s)
-    if n and n >= minv and n <= maxv then return n end
-    term.setCursorPos(1, 5); term.clearLine(); print(("Enter a number between %d and %d."):format(minv, maxv))
-  end
-end
-
-local function generate_code4()
-  return ("%04d"):format(math.random(0, 9999))
-end
-
+-- 2s port sniff for noise
 local function is_port_secure(port)
   local m = modem_or_error()
   if m.closeAll then pcall(function() m.closeAll() end) end
@@ -121,26 +107,23 @@ local function is_port_secure(port)
   return true
 end
 
-function M.start_pairing_interactive()
-  M.pairing_active = false
-  M.port, M.code = nil, ""
-
-  -- Ensure we have a wireless modem selected
+-- NEW: Start pairing on a given port. Called by UI (no read() here)
+function M.start_pairing_on_port(port)
   modem_or_error()
   local isW = (M._modem.isWireless and M._modem.isWireless()) and true or false
   print(("[JoinService] Using modem '%s' (Wireless=%s)"):format(M._modem_name or "?", tostring(isW)))
 
-  local pairing_port
-  while true do
-    pairing_port = read_number("Enter secure pairing port (0-65535): ", 0, 65535)
-    if is_port_secure(pairing_port) then break end
-    term.setCursorPos(1, 6); term.clearLine(); print("Please choose a different port.")
+  if not (type(port)=="number" and port>=0 and port<=65535) then
+    return false, "invalid_port"
+  end
+  if not is_port_secure(port) then
+    return false, "noisy_port"
   end
 
-  ensure_only_port_open(pairing_port)
+  ensure_only_port_open(port)
 
-  M.port    = pairing_port
-  M.code    = generate_code4()
+  M.port    = port
+  M.code    = ("%04d"):format(math.random(0, 9999))
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
   M.attempts, M.quarantine, M.sessions, M.pending, M.approved = {}, {}, {}, {}, {}
@@ -148,6 +131,7 @@ function M.start_pairing_interactive()
 
   Log.info("system", ("Pairing started on %s port %d with code %s"):format(M._modem_name or "modem", M.port, M.code))
   print(("[JoinService] Pairing ARMED: port=%d code=%s"):format(M.port, M.code))
+  return true
 end
 
 function M.stop_pairing()
@@ -170,6 +154,7 @@ local function push_pending(hello)
   Log.info("system", ("Join request queued: %s (%s)"):format(id, tostring(hello.node_kind)))
 end
 
+-- FIX: Do not send policy twice (no repeated table refs)
 function M.approve_index(i)
   local rec = M.pending[i]
   if not rec then return false, "no_pending" end
@@ -182,12 +167,12 @@ function M.approve_index(i)
     caps = { can_fire = true, can_aim = true },
     min_cooldown_ms = (Cfg.security and Cfg.security.min_cooldown_ms) or 3000
   })
+  -- Only include lease; do not duplicate policy at top-level
   local frame = Net.wrap(sess, {
     type       = "JOIN_WELCOME",
     accepted   = true,
     cluster_id = Cfg.system.cluster_id,
-    lease      = lease,
-    policy     = lease.policy
+    lease      = lease
   }, { dev = rec.hello.device_id })
   send_on(frame)
   table.insert(M.approved, { id = rec.id, lease = lease, hello = rec.hello, ts = now() })
@@ -239,6 +224,7 @@ local function handle_join_hello(msg)
     return
   end
 
+  -- Send seed and create session
   local seed = HS.build_welcome_seed(dev_id, M.code, msg.nonceW)
   send_on(seed)
   local sess = HS.derive_pair_session(M.code, dev_id, msg.nonceW, seed.nonceM, Net)
