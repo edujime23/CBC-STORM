@@ -1,5 +1,9 @@
 -- /storm/core/join_service.lua
 -- Secure pairing with operator-chosen port, no discovery, 4-digit code, limited attempts, quarantine.
+-- Fixes:
+--  - Port sniff window = 2 seconds
+--  - Correct modem_message param usage (channel vs replyChannel)
+--  - Debug prints on receive
 
 local U  = require("/storm/lib/utils")
 local C  = require("/storm/lib/config_loader")
@@ -11,7 +15,7 @@ local M = {
   expires          = 0,
   code             = "",
   port             = nil,
-  pending          = {},   -- queue for UI approvals
+  pending          = {},
   approved         = {},
   attempts         = {},   -- attempts[device_id] = count
   quarantine       = {},   -- quarantine[device_id] = until_ms
@@ -19,7 +23,6 @@ local M = {
   _last_info_ms    = 0
 }
 
--- Defaults if not present in config
 local function cfg_attempt_limit() return (C.security and C.security.pairing_attempt_limit) or 4 end
 local function cfg_quarantine_ttl() return (C.security and C.security.quarantine_ttl_ms) or (15*60*1000) end
 local function cfg_pairing_window() return (C.system and C.system.join_psk_window_s and C.system.join_psk_window_s*1000) or (5*60*1000) end
@@ -53,7 +56,7 @@ local function send_on(tbl)
   m.transmit(M.port, M.port, tbl)
 end
 
--- Operator prompt helpers
+-- UI helpers
 local function read_number(prompt, minv, maxv)
   while true do
     term.setCursorPos(1, 4); term.clearLine(); io.write(prompt)
@@ -68,21 +71,21 @@ local function generate_code4()
   return ("%04d"):format(math.random(0, 9999))
 end
 
--- Check if a port is "quiet" (no foreign traffic) for a short window.
+-- Sniff 2 seconds for any traffic on the port
 local function is_port_secure(port)
   local m = modem_or_error()
   if m.closeAll then pcall(function() m.closeAll() end) end
   if not m.isOpen(port) then pcall(function() m.open(port) end) end
 
-  print(("[JoinService] Testing port %d for noise..."):format(port))
-  local t = os.startTimer(1.0) -- 1 second sniff
+  print(("[JoinService] Testing port %d for noise (2s)..."):format(port))
+  local t = os.startTimer(2.0)
   while true do
     local ev, p1, p2, p3, p4, p5 = os.pullEvent()
     if ev == "timer" and p1 == t then
       break
     elseif ev == "modem_message" then
-      local side, rch, reply, msg, dist = p1, p2, p3, p4, p5
-      if rch == port then
+      local side, channel, reply, msg, dist = p1, p2, p3, p4, p5
+      if channel == port then
         print("[JoinService] Traffic detected on chosen port. Not secure.")
         return false
       end
@@ -93,10 +96,8 @@ local function is_port_secure(port)
 end
 
 function M.start_pairing_interactive()
-  -- Ask operator for port, verify quietness, then start pairing.
   M.pairing_active = false
-  M.port = nil
-  M.code = ""
+  M.port, M.code = nil, ""
 
   local pairing_port
   while true do
@@ -107,8 +108,8 @@ function M.start_pairing_interactive()
 
   ensure_only_port_open(pairing_port)
 
-  M.port = pairing_port
-  M.code = generate_code4()
+  M.port   = pairing_port
+  M.code   = generate_code4()
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
   M.attempts, M.quarantine = {}, {}
@@ -169,7 +170,6 @@ local function handle_join_hello(msg)
   if not M.pairing_active or not M.port then return end
 
   local dev_id = msg.device_id or -1
-  -- Quarantine check
   local q = M.quarantine[dev_id]
   if q and q > now() then
     send_on({ type = "JOIN_DENY", reason = "quarantine", until_ms = q })
@@ -177,7 +177,6 @@ local function handle_join_hello(msg)
     return
   end
 
-  -- Validate code (4-digit numeric)
   local ok_code = (type(msg.code) == "string" or type(msg.code) == "number") and (tostring(msg.code) == M.code)
   if not ok_code then
     local attempts = (M.attempts[dev_id] or 0) + 1
@@ -195,19 +194,18 @@ local function handle_join_hello(msg)
     return
   end
 
-  -- Correct code: push to pending approval
   push_pending(msg)
+  print(("[JoinService] JOIN_HELLO accepted from device %s"):format(tostring(msg.device_id)))
   send_on({ type = "JOIN_ACK", queued = true })
 end
 
-local function handle_modem_message(side, ch, rch, msg, dist)
+local function handle_modem_message(side, channel, replyChannel, msg, dist)
   if not M.pairing_active then return end
-  if not M.port or rch ~= M.port then return end
+  if not M.port or channel ~= M.port then return end
   if type(msg) ~= "table" then return end
   if msg.type == "JOIN_HELLO" then
     handle_join_hello(msg)
   else
-    -- Unknown traffic during active pairing: treat as hostile and auto-close pairing
     L.warn("system", ("Unexpected traffic on pairing port %d; closing pairing"):format(M.port))
     M.stop_pairing()
   end
@@ -222,7 +220,6 @@ function M.run()
       if ev == "timer" and p1 == t then break
       elseif ev == "modem_message" then handle_modem_message(p1, p2, p3, p4, p5) end
     end
-    -- Expiry
     if M.pairing_active and now() > (M.expires or 0) then
       L.info("system", "Pairing window expired")
       M.stop_pairing()
