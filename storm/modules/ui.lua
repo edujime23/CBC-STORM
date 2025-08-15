@@ -1,5 +1,4 @@
 -- /storm/modules/ui.lua
--- Controller UI: cursor-safe, hotkeys never leak, UI handles prompts. Adds Workers view with Ping.
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -16,8 +15,7 @@ local function safe_write_line(y, text)
   term.setTextColor(colors.white)
   term.clearLine()
   if text then term.write(text) end
-  term.setBackgroundColor(oldBG)
-  term.setTextColor(oldFG)
+  term.setBackgroundColor(oldBG); term.setTextColor(oldFG)
   term.setCursorPos(cx, cy)
 end
 
@@ -69,47 +67,41 @@ local function read_line_filtered(prompt, allowed)
       function() local _, k = os.pullEvent("key");  got_key  = true; key = k end
     )
     if got_char then
-      if (not allowed) or allowed(ch) then
-        buf = buf .. ch
-        term.write(ch)
-      end
+      if (not allowed) or allowed(ch) then buf = buf .. ch; term.write(ch) end
     elseif got_key then
-      if key == keys.enter then
-        print("")
-        return buf
+      if key == keys.enter then print(""); return buf
       elseif key == keys.backspace then
-        if #buf > 0 then
-          local x, y = term.getCursorPos()
-          term.setCursorPos(x-1, y); term.write(" "); term.setCursorPos(x-1, y)
-          buf = string.sub(buf, 1, #buf - 1)
-        end
-      elseif key == keys.escape then
-        print("")
-        return nil
-      end
+        if #buf > 0 then local x,y=term.getCursorPos(); term.setCursorPos(x-1,y); term.write(" "); term.setCursorPos(x-1,y); buf=buf:sub(1,#buf-1) end
+      elseif key == keys.escape then print(""); return nil end
     end
   end
 end
 
+local function redraw_all()
+  term.clear()
+  header()
+  safe_write_line(3, "Home: [P] Pair  [A] Approvals  [W] Workers  [Q] Quit")
+  footer()
+  pairing_info()
+end
+
 local function pair_wizard()
   M.suspend_ticks = true
-  term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")
+  safe_write_line(3, "SECURE PAIRING SETUP")
   local function allow_digits(c) return c >= '0' and c <= '9' end
   while true do
     local inp = read_line_filtered("Enter secure pairing port (0-65535) [Esc cancel]: ", allow_digits)
     if not inp or inp == "" then break end
     local port = tonumber(inp)
-    if not port or port < 0 or port > 65535 then
-      term.setCursorPos(1, 3); term.clearLine(); print("Invalid port. Try again.")
+    if not port or port < 0 or port > 65535 then safe_write_line(3, "Invalid port. Try again.")
     else
       local ok, err = Join.start_pairing_on_port(port)
-      if ok then break end
-      term.setCursorPos(1, 3); term.clearLine()
-      if err == "noisy_port" then print("Port had traffic. Choose another.") else print("Pairing failed: "..tostring(err)) end
+      if ok then break
+      else safe_write_line(3, err=="noisy_port" and "Port had traffic. Choose another." or ("Pairing failed: "..tostring(err))) end
     end
   end
   M.suspend_ticks = false
-  header(); footer(); pairing_info()
+  redraw_all()
 end
 
 local function approvals_screen()
@@ -128,7 +120,6 @@ local function approvals_screen()
           math.floor((U.now_ms() - rec.ts) / 1000)))
       end
     end
-
     if #list == 0 then
       safe_write_line(h - 2, "No pending join requests. Press ESC or 'q' to return.")
       local function allow_empty(c) return c=='q' or c=='Q' end
@@ -140,23 +131,20 @@ local function approvals_screen()
       local inp = read_line_filtered("> ", allow_approvals_char)
       if not inp then break
       elseif inp == "" then
-      elseif inp:lower() == "q" then
-        break
+      elseif inp:lower() == "q" then break
       elseif inp:match("^%d+$") then
         local idx = tonumber(inp)
         local ok, err = Join.approve_index(idx)
-        term.setCursorPos(1, h - 3); term.clearLine()
-        if ok then term.write("Approved #" .. idx) else term.write("Approve failed: "..tostring(err)) end
+        safe_write_line(h - 3, ok and ("Approved #"..idx) or ("Approve failed: "..tostring(err)))
       elseif inp:match("^[dD]%d+$") then
-        local idx = tonumber(string.sub(inp, 2))
+        local idx = tonumber(inp:sub(2))
         local ok, err = Join.deny_index(idx)
-        term.setCursorPos(1, h - 3); term.clearLine()
-        if ok then term.write("Denied #" .. idx) else term.write("Deny failed: "..tostring(err)) end
+        safe_write_line(h - 3, ok and ("Denied #"..idx) or ("Deny failed: "..tostring(err)))
       end
     end
   end
   M.suspend_ticks = false
-  term.clear(); header(); footer(); pairing_info()
+  redraw_all()
 end
 
 local function workers_screen()
@@ -171,51 +159,52 @@ local function workers_screen()
       local w = list[i]
       if w then
         local rtt = w.last_rtt and (tostring(w.last_rtt).."ms") or "n/a"
-        term.write(("[%d] dev=%s  modem=%s  rtt=%s"):format(
-          i, tostring(w.dev_id), tostring(w.modem or "?"), rtt))
+        local st  = w.status and (w.status.run and "RUN" or "STOP") or "?"
+        term.write(("[%d] dev=%s  modem=%s  rtt=%s  status=%s"):format(
+          i, tostring(w.dev_id), tostring(w.modem or "?"), rtt, st))
       end
     end
-    safe_write_line(h - 2, "Type 'pN' to ping (e.g., p1), 'q' to exit.")
-    local function allow_workers_char(c) return (c >= '0' and c <= '9') or c=='p' or c=='P' or c=='q' or c=='Q' end
+    safe_write_line(h - 2, "Type: pN ping | sN status | fN test fire | lN log | q exit.")
+    local function allow_workers_char(c) return (c >= '0' and c <= '9') or c=='p' or c=='P' or c=='s' or c=='S' or c=='f' or c=='F' or c=='l' or c=='L' or c=='q' or c=='Q' end
     local inp = read_line_filtered("> ", allow_workers_char)
-    if not inp then break
-    elseif inp == "" then
-    elseif inp:lower() == "q" then break
-    elseif inp:match("^[pP]%d+$") then
-      local idx = tonumber(string.sub(inp, 2))
-      local w = list[idx]
-      term.setCursorPos(1, h - 3); term.clearLine()
+    if not inp or inp:lower()=="q" then break end
+    if inp:match("^[pP]%d+$") then
+      local idx = tonumber(inp:sub(2)); local w = list[idx]
+      safe_write_line(h - 3, (w and Join.ping_worker(w.dev_id)) and ("Ping sent to dev="..tostring(w.dev_id)) or "Ping failed/invalid index.")
+    elseif inp:match("^[sS]%d+$") then
+      local idx = tonumber(inp:sub(2)); local w = list[idx]
+      safe_write_line(h - 3, (w and Join.status_worker(w.dev_id)) and ("Status requested from dev="..tostring(w.dev_id)) or "Status failed/invalid index.")
+    elseif inp:match("^[fF]%d+$") then
+      local idx = tonumber(inp:sub(2)); local w = list[idx]
+      safe_write_line(h - 3, (w and Join.fire_worker(w.dev_id, { rounds=1 })) and ("Test fire sent to dev="..tostring(w.dev_id)) or "Fire failed/invalid index.")
+    elseif inp:match("^[lL]%d+$") then
+      local idx = tonumber(inp:sub(2)); local w = list[idx]
       if w then
-        local ok, err = Join.ping_worker(w.dev_id)
-        if ok then term.write("Ping sent to dev="..tostring(w.dev_id).." (check RTT next refresh).")
-        else term.write("Ping failed: "..tostring(err)) end
+        local any = function(_) return true end
+        local msg = read_line_filtered("Log text: ", any)
+        safe_write_line(h - 3, (Join.log_worker(w.dev_id, msg or "")) and ("Log sent to dev="..tostring(w.dev_id)) or "Log failed.")
       else
-        term.write("Invalid index.")
+        safe_write_line(h - 3, "Invalid index.")
       end
     end
   end
   M.suspend_ticks = false
-  term.clear(); header(); footer(); pairing_info()
+  redraw_all()
 end
 
 function M.run()
-  term.clear(); header(); footer(); pairing_info()
+  redraw_all()
   local function key_loop()
     while true do
-      local _, k = os.pullEvent("key") -- key-only, never modem_message
-      if k == keys.p then
-        pair_wizard()
-      elseif k == keys.a then
-        approvals_screen()
-      elseif k == keys.w then
-        workers_screen()
-      elseif k == keys.q then
-        return
-      end
+      local _, k = os.pullEvent("key")
+      if k == keys.p then pair_wizard()
+      elseif k == keys.a then approvals_screen()
+      elseif k == keys.w then workers_screen()
+      elseif k == keys.q then return end
     end
   end
   local function tick_loop()
-    while true do pairing_info(); U.sleep_ms(150) end
+    while true do pairing_info(); U.sleep_ms(250) end
   end
   parallel.waitForAny(key_loop, tick_loop)
 end
