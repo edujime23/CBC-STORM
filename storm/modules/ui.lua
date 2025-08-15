@@ -1,5 +1,6 @@
 -- /storm/modules/ui.lua
--- Controller UI: secure pairing (ask port), approvals screen.
+-- Controller UI: secure pairing (ask port), approvals screen, cursor-safe drawing.
+
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -7,31 +8,50 @@ local U    = require("/storm/lib/utils")
 
 local M = {}
 
+-- Internal flag: when true, we suspend the bottom status ticker to avoid cursor jumps.
+M.suspend_ticks = false
+
+local function safe_write_line(y, text)
+  -- Preserve cursor + colors while drawing UI
+  local cx, cy = term.getCursorPos()
+  local oldBG, oldFG = term.getBackgroundColor(), term.getTextColor()
+  term.setCursorPos(1, y)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clearLine()
+  if text then term.write(text) end
+  term.setBackgroundColor(oldBG)
+  term.setTextColor(oldFG)
+  term.setCursorPos(cx, cy)
+end
+
 local function header()
-  term.setCursorPos(1, 1); term.clearLine()
-  term.write(("SKYNET ETERNAL v4.0 | Cluster: %s | Dim: %s"):format(C.system.cluster_id or "?", C.system.dimension or "?"))
+  safe_write_line(1, ("SKYNET ETERNAL v4.0 | Cluster: %s | Dim: %s")
+    :format(C.system.cluster_id or "?", C.system.dimension or "?"))
 end
 
 local function footer()
   local _, h = term.getSize()
-  term.setCursorPos(1, h); term.clearLine()
-  term.write("[P] Pair  [A] Approvals  [Q] Quit")
+  safe_write_line(h, "[P] Pair  [A] Approvals  [Q] Quit")
 end
 
 local function pairing_info()
+  if M.suspend_ticks then return end
   local code = Join.get_active_code()
   local port = Join.get_active_port()
   local _, h = term.getSize()
-  term.setCursorPos(1, h - 1); term.clearLine()
   if code and port then
-    term.write("Pairing active. Port: " .. tostring(port) .. "  Code: " .. tostring(code))
+    safe_write_line(h - 1, "Pairing active. Port: " .. tostring(port) .. "  Code: " .. tostring(code))
   else
-    term.write("Pairing idle.")
+    safe_write_line(h - 1, "Pairing idle.")
   end
 end
 
 local function approvals_screen()
+  -- Suspend ticker during interactive input
+  M.suspend_ticks = true
   term.clear(); header()
+
   local _, h = term.getSize()
   while true do
     term.setCursorPos(1, 3); term.clearLine(); term.write("Pending join requests:")
@@ -47,11 +67,11 @@ local function approvals_screen()
       end
     end
 
-    term.setCursorPos(1, h - 2); term.clearLine()
-    term.write("Enter number to approve, 'dN' to deny (e.g., d1), ENTER to refresh, ESC to exit.")
+    safe_write_line(h - 2, "Enter number to approve, 'dN' to deny (e.g., d1), ENTER to refresh, ESC to exit.")
     term.setCursorPos(1, h - 1); term.clearLine(); term.write("> ")
     local inp = read()
     if inp == "" then
+      -- refresh
     elseif inp == "\27" then
       break
     elseif inp:match("^%d+$") then
@@ -62,6 +82,10 @@ local function approvals_screen()
       if not Join.deny_index(idx) then L.warn("system", "Deny failed: invalid index") end
     end
   end
+
+  -- Resume ticker
+  M.suspend_ticks = false
+  term.clear(); header(); footer(); pairing_info()
 end
 
 function M.run()
@@ -69,12 +93,16 @@ function M.run()
 
   local function key_loop()
     while true do
-      local _, k = os.pullEvent("key") -- IMPORTANT: only consume key events
+      local _, k = os.pullEvent("key") -- Important: only consume key events
       if k == keys.p then
+        -- Suspend ticker during Join.start_pairing_interactive (it uses read)
+        M.suspend_ticks = true
         term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")
         Join.start_pairing_interactive()
+        M.suspend_ticks = false
+        header(); footer(); pairing_info()
       elseif k == keys.a then
-        approvals_screen(); term.clear(); header(); footer()
+        approvals_screen()
       elseif k == keys.q then
         return
       end
@@ -84,7 +112,7 @@ function M.run()
   local function tick_loop()
     while true do
       pairing_info()
-      U.sleep_ms(200)
+      U.sleep_ms(150)
     end
   end
 
