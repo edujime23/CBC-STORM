@@ -15,6 +15,7 @@
         "storm/lib/utils.lua",
         "storm/lib/logger.lua",
         "storm/lib/config_loader.lua",
+        "storm/lib/hopper.lua",
 
         "storm/encryption/crypto.lua",
         "storm/encryption/netsec.lua",
