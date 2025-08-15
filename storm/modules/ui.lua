@@ -1,4 +1,7 @@
 -- /storm/modules/ui.lua
+-- Controller UI: cursor-safe, hotkeys never leak, UI handles prompts.
+-- Adds Workers view with live refresh (ping/status/fire/log), and a persistent home screen.
+
 local C    = require("/storm/lib/config_loader")
 local L    = require("/storm/lib/logger")
 local Join = require("/storm/core/join_service")
@@ -15,7 +18,8 @@ local function safe_write_line(y, text)
   term.setTextColor(colors.white)
   term.clearLine()
   if text then term.write(text) end
-  term.setBackgroundColor(oldBG); term.setTextColor(oldFG)
+  term.setBackgroundColor(oldBG)
+  term.setTextColor(oldFG)
   term.setCursorPos(cx, cy)
 end
 
@@ -87,17 +91,22 @@ end
 
 local function pair_wizard()
   M.suspend_ticks = true
+  local _, h = term.getSize()
   safe_write_line(3, "SECURE PAIRING SETUP")
   local function allow_digits(c) return c >= '0' and c <= '9' end
   while true do
     local inp = read_line_filtered("Enter secure pairing port (0-65535) [Esc cancel]: ", allow_digits)
     if not inp or inp == "" then break end
     local port = tonumber(inp)
-    if not port or port < 0 or port > 65535 then safe_write_line(3, "Invalid port. Try again.")
+    if not port or port < 0 or port > 65535 then
+      safe_write_line(3, "Invalid port. Try again.")
     else
       local ok, err = Join.start_pairing_on_port(port)
       if ok then break
-      else safe_write_line(3, err=="noisy_port" and "Port had traffic. Choose another." or ("Pairing failed: "..tostring(err))) end
+      else
+        if err == "noisy_port" then safe_write_line(3, "Port had traffic. Choose another.")
+        else safe_write_line(3, "Pairing failed: "..tostring(err)) end
+      end
     end
   end
   M.suspend_ticks = false
@@ -120,6 +129,7 @@ local function approvals_screen()
           math.floor((U.now_ms() - rec.ts) / 1000)))
       end
     end
+
     if #list == 0 then
       safe_write_line(h - 2, "No pending join requests. Press ESC or 'q' to return.")
       local function allow_empty(c) return c=='q' or c=='Q' end
@@ -131,7 +141,8 @@ local function approvals_screen()
       local inp = read_line_filtered("> ", allow_approvals_char)
       if not inp then break
       elseif inp == "" then
-      elseif inp:lower() == "q" then break
+      elseif inp:lower() == "q" then
+        break
       elseif inp:match("^%d+$") then
         local idx = tonumber(inp)
         local ok, err = Join.approve_index(idx)
@@ -147,47 +158,133 @@ local function approvals_screen()
   redraw_all()
 end
 
+-- Live Workers screen with parallel refresh and input
 local function workers_screen()
   M.suspend_ticks = true
   term.clear(); header()
-  local _, h = term.getSize()
-  while true do
+  local w, h = term.getSize()
+  local top_y = 3
+  local list_height = h - 6  -- leave bottom 3 lines for status/prompt/footer
+  local status_y = h - 3
+  local prompt_y = h - 2
+
+  local status_msg = ""
+
+  local function draw_list()
+    term.setCursorPos(1, top_y); term.clearLine(); term.write("Workers:")
     local list = Join.get_workers()
-    term.setCursorPos(1, 3); term.clearLine(); term.write("Workers:")
-    for i = 1, math.max(10, #list) do
-      term.setCursorPos(1, 3 + i); term.clearLine()
-      local w = list[i]
-      if w then
-        local rtt = w.last_rtt and (tostring(w.last_rtt).."ms") or "n/a"
-        local st  = w.status and (w.status.run and "RUN" or "STOP") or "?"
+    for i = 1, list_height do
+      term.setCursorPos(1, top_y + i)
+      term.clearLine()
+      local item = list[i]
+      if item then
+        local rtt = item.last_rtt and (tostring(item.last_rtt).."ms") or "n/a"
+        local st  = (item.status and item.status.run ~= nil) and (item.status.run and "RUN" or "STOP") or "?"
         term.write(("[%d] dev=%s  modem=%s  rtt=%s  status=%s"):format(
-          i, tostring(w.dev_id), tostring(w.modem or "?"), rtt, st))
+          i, tostring(item.dev_id), tostring(item.modem or "?"), rtt, st))
       end
     end
-    safe_write_line(h - 2, "Type: pN ping | sN status | fN test fire | lN log | q exit.")
-    local function allow_workers_char(c) return (c >= '0' and c <= '9') or c=='p' or c=='P' or c=='s' or c=='S' or c=='f' or c=='F' or c=='l' or c=='L' or c=='q' or c=='Q' end
-    local inp = read_line_filtered("> ", allow_workers_char)
-    if not inp or inp:lower()=="q" then break end
-    if inp:match("^[pP]%d+$") then
-      local idx = tonumber(inp:sub(2)); local w = list[idx]
-      safe_write_line(h - 3, (w and Join.ping_worker(w.dev_id)) and ("Ping sent to dev="..tostring(w.dev_id)) or "Ping failed/invalid index.")
-    elseif inp:match("^[sS]%d+$") then
-      local idx = tonumber(inp:sub(2)); local w = list[idx]
-      safe_write_line(h - 3, (w and Join.status_worker(w.dev_id)) and ("Status requested from dev="..tostring(w.dev_id)) or "Status failed/invalid index.")
-    elseif inp:match("^[fF]%d+$") then
-      local idx = tonumber(inp:sub(2)); local w = list[idx]
-      safe_write_line(h - 3, (w and Join.fire_worker(w.dev_id, { rounds=1 })) and ("Test fire sent to dev="..tostring(w.dev_id)) or "Fire failed/invalid index.")
-    elseif inp:match("^[lL]%d+$") then
-      local idx = tonumber(inp:sub(2)); local w = list[idx]
-      if w then
-        local any = function(_) return true end
-        local msg = read_line_filtered("Log text: ", any)
-        safe_write_line(h - 3, (Join.log_worker(w.dev_id, msg or "")) and ("Log sent to dev="..tostring(w.dev_id)) or "Log failed.")
-      else
-        safe_write_line(h - 3, "Invalid index.")
-      end
+    return list
+  end
+
+  local running = true
+  local input_buf = ""
+
+  local function refresh_loop()
+    while running do
+      local list = draw_list()
+      safe_write_line(status_y, status_msg)
+      -- redraw footer and pairing line ourselves (suspend_ticks true)
+      safe_write_line(h, "[P] Pair  [A] Approvals  [W] Workers  [Q] Quit")
+      safe_write_line(h - 1, "") -- keep bottom status for pairing free
+      -- redraw prompt with buffer
+      term.setCursorPos(1, prompt_y); term.clearLine()
+      term.write("Type: pN ping | sN status | fN test fire | lN log | q exit.  > " .. input_buf)
+      U.sleep_ms(400)
     end
   end
+
+  local function input_loop()
+    flush_chars(0.05)
+    while running do
+      local ev, p = os.pullEvent()
+      if ev == "char" then
+        input_buf = input_buf .. p
+        term.setCursorPos(1, prompt_y); term.clearLine()
+        term.write("Type: pN ping | sN status | fN test fire | lN log | q exit.  > " .. input_buf)
+      elseif ev == "key" then
+        if p == keys.backspace then
+          if #input_buf > 0 then
+            input_buf = input_buf:sub(1, #input_buf - 1)
+            term.setCursorPos(1, prompt_y); term.clearLine()
+            term.write("Type: pN ping | sN status | fN test fire | lN log | q exit.  > " .. input_buf)
+          end
+        elseif p == keys.enter then
+          local cmd = input_buf
+          input_buf = ""
+          term.setCursorPos(1, prompt_y); term.clearLine()
+          term.write("Type: pN ping | sN status | fN test fire | lN log | q exit.  > ")
+
+          -- Process command
+          local list = Join.get_workers()
+          if cmd == "" then
+            -- no-op; refresh happens automatically
+          elseif cmd:lower() == "q" then
+            running = false
+            break
+          elseif cmd:match("^[pP]%d+$") then
+            local idx = tonumber(cmd:sub(2)); local w = list[idx]
+            if w then
+              local ok, err = Join.ping_worker(w.dev_id)
+              status_msg = ok and ("Ping sent to dev="..tostring(w.dev_id)..". Waiting for PONG...") or ("Ping failed: "..tostring(err))
+            else
+              status_msg = "Invalid index."
+            end
+          elseif cmd:match("^[sS]%d+$") then
+            local idx = tonumber(cmd:sub(2)); local w = list[idx]
+            if w then
+              local ok, err = Join.status_worker(w.dev_id)
+              status_msg = ok and ("Status requested from dev="..tostring(w.dev_id)..".") or ("Status failed: "..tostring(err))
+            else
+              status_msg = "Invalid index."
+            end
+          elseif cmd:match("^[fF]%d+$") then
+            local idx = tonumber(cmd:sub(2)); local w = list[idx]
+            if w then
+              local ok, err = Join.fire_worker(w.dev_id, { rounds=1 })
+              status_msg = ok and ("Test fire sent to dev="..tostring(w.dev_id)..".") or ("Fire failed: "..tostring(err))
+            else
+              status_msg = "Invalid index."
+            end
+          elseif cmd:match("^[lL]%d+$") then
+            local idx = tonumber(cmd:sub(2)); local w = list[idx]
+            if w then
+              -- small inline message read
+              safe_write_line(prompt_y, "Log text (Enter to send, Esc to cancel): ")
+              local any = function(_) return true end
+              local msg = read_line_filtered("", any)
+              if msg then
+                local ok, err = Join.log_worker(w.dev_id, msg)
+                status_msg = ok and ("Log sent to dev="..tostring(w.dev_id)..".") or ("Log failed: "..tostring(err))
+              else
+                status_msg = "Log cancelled."
+              end
+            else
+              status_msg = "Invalid index."
+            end
+          else
+            status_msg = "Unknown command. Use pN/sN/fN/lN/q."
+          end
+        elseif p == keys.escape then
+          running = false
+          break
+        end
+      end
+      -- Never consume modem_message here
+    end
+  end
+
+  parallel.waitForAny(refresh_loop, input_loop)
   M.suspend_ticks = false
   redraw_all()
 end
@@ -197,10 +294,15 @@ function M.run()
   local function key_loop()
     while true do
       local _, k = os.pullEvent("key")
-      if k == keys.p then pair_wizard()
-      elseif k == keys.a then approvals_screen()
-      elseif k == keys.w then workers_screen()
-      elseif k == keys.q then return end
+      if k == keys.p then
+        pair_wizard()
+      elseif k == keys.a then
+        approvals_screen()
+      elseif k == keys.w then
+        workers_screen()
+      elseif k == keys.q then
+        return
+      end
     end
   end
   local function tick_loop()
