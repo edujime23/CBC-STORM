@@ -3,47 +3,49 @@
   "version_file": "version.json",
   "node_types": {
     "controller": {
-      "description": "Full installation for a master/controller node.",
+      "description": "Full installation for a master/controller node (alpha skeleton + stealth pairing).",
       "files": [
         "storm/core/kernel.lua",
-        "storm/core/consensus.lua",
+        "storm/core/join_service.lua",
         "storm/core/network.lua",
-        "storm/core/federation.lua",
-        "storm/core/resurrection.lua",
-        "storm/core/alliance.lua",
-        "storm/core/orders.lua",
-        "storm/core/safety.lua",
-        "storm/modules/cannon_control.lua",
-        "storm/modules/player_detect.lua",
-        "storm/modules/targeting.lua",
-        "storm/modules/iff.lua",
-        "storm/modules/dimensional.lua",
-        "storm/modules/portal_tracker.lua",
-        "storm/modules/time_sync.lua",
+
         "storm/modules/ui.lua",
+        "storm/modules/time_sync.lua",
+
         "storm/lib/utils.lua",
         "storm/lib/logger.lua",
         "storm/lib/config_loader.lua",
-        "storm/lib/crypto.lua",
-        "storm/worker_payloads/worker_cannon.lua",
-        "storm/worker_payloads/worker_detector.lua",
-        "storm/worker_payloads/worker_netlib.lua",
+
+        "storm/encryption/crypto.lua",
+        "storm/encryption/netsec.lua",
+        "storm/encryption/handshake.lua",
+
+        "storm/config/system.cfg",
+        "storm/config/network.cfg",
+        "storm/config/security.cfg",
+
         "storm/update.lua"
       ]
     },
     "worker": {
-      "description": "Minimal bootstrap script for a worker node.",
+      "description": "Minimal bootstrap script for a worker node (cannon skeleton + onboarding).",
       "files": [
-        "register.lua",
-        "storm/lib/crypto.lua"
+        "storm/worker_payloads/worker_common.lua",
+        "storm/worker_payloads/worker_cannon.lua",
+
+        "storm/lib/utils.lua",
+        "storm/lib/logger.lua",
+        "storm/lib/config_loader.lua",
+
+        "storm/encryption/crypto.lua",
+        "storm/encryption/handshake.lua",
+        "storm/encryption/netsec.lua"
       ]
     },
     "seed": {
-      "description": "Recovery files for a dormant seed node.",
+      "description": "Recovery files for a dormant seed node (skeleton).",
       "files": [
-        "seed/bootstrap.lua",
-        "seed/lib/decompress.lua",
-        "seed/lib/decrypt.lua"
+        "seed/bootstrap.lua"
       ]
     }
   }
