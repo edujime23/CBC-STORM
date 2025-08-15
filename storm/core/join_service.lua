@@ -1,13 +1,12 @@
 -- /storm/core/join_service.lua
--- Secure pairing (operator-chosen port, no discovery) + debug + PAIR_READY ping + encrypted ACK/WELCOME.
-
+-- Secure pairing on operator-chosen port; no terminal spam; logs to /storm/journal/pairing.log
 local U   = require("/storm/lib/utils")
 local Cfg = require("/storm/lib/config_loader")
 local Log = require("/storm/lib/logger")
 local HS  = require("/storm/encryption/handshake")
 local Net = require("/storm/encryption/netsec")
 
-local DEBUG = true
+local DEBUG = false  -- set true only for one-off debugging
 
 local M = {
   pairing_active   = false,
@@ -20,7 +19,7 @@ local M = {
   quarantine       = {},
   _modem           = nil,
   _last_ready_ms   = 0,
-  sessions         = {}   -- sessions[device_id] = session (k_enc,k_mac,salt4,seqs)
+  sessions         = {}
 }
 
 local function cfg_attempt_limit() return (Cfg.security and Cfg.security.pairing_attempt_limit) or 4 end
@@ -33,17 +32,13 @@ local function modem_or_error()
   local m = peripheral.find("modem")
   if not m then error("No modem found") end
   M._modem = m
-  local name = peripheral.getName(m) or "modem"
-  local wireless = (m.isWireless and m.isWireless()) and "true" or "false"
-  if DEBUG then print(("[JoinService] Modem: %s | Wireless: %s"):format(name, wireless)) end
   return m
 end
 
 local function dbg_open_channels(tag, ch)
+  if not DEBUG then return end
   local m = modem_or_error()
-  if DEBUG then
-    print(("[JoinService][%s] isOpen(%d)=%s"):format(tag, ch, tostring(m.isOpen and m.isOpen(ch) or false)))
-  end
+  print(("[JoinService][%s] isOpen(%d)=%s"):format(tag, ch, tostring(m.isOpen and m.isOpen(ch) or false)))
 end
 
 local function ensure_only_port_open(port)
@@ -62,7 +57,6 @@ end
 local function send_on(tbl)
   local m = modem_or_error()
   if not M.port then return end
-  if DEBUG then print(("[JoinService] TX on %d: %s"):format(M.port, type(tbl)=="table" and (tbl.type or "table") or tostring(tbl))) end
   Log.info("pairing", "TX on "..tostring(M.port)..": "..(type(tbl)=="table" and (tbl.type or "table") or type(tbl)))
   m.transmit(M.port, M.port, tbl)
 end
@@ -93,13 +87,9 @@ local function is_port_secure(port)
     local ev, side, channel, reply, msg, dist = os.pullEvent()
     if ev == "timer" and side == t then
       break
-    elseif ev == "modem_message" then
-      if channel == port then
-        print(("[JoinService] Noise detected: ch=%d reply=%s type=%s dist=%s"):format(channel, tostring(reply), type(msg)=="table" and (msg.type or "table") or type(msg), tostring(dist)))
-        return false
-      elseif DEBUG then
-        print(("[JoinService] Ignored traffic: ch=%d (not %d)"):format(channel, port))
-      end
+    elseif ev == "modem_message" and channel == port then
+      print(("[JoinService] Noise detected: ch=%d type=%s"):format(channel, type(msg)=="table" and (msg.type or "table") or type(msg)))
+      return false
     end
   end
   print("[JoinService] Port appears quiet. Proceeding.")
@@ -123,7 +113,7 @@ function M.start_pairing_interactive()
   M.code    = generate_code4()
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
-  M.attempts, M.quarantine, M.sessions = {}, {}, {}
+  M.attempts, M.quarantine, M.sessions, M.pending, M.approved = {}, {}, {}, {}, {}
   M._last_ready_ms = 0
 
   Log.info("system", ("Pairing started on port %d with code %s"):format(M.port, M.code))
@@ -131,7 +121,6 @@ function M.start_pairing_interactive()
 end
 
 function M.stop_pairing()
-  if DEBUG then print("[JoinService] stop_pairing()") end
   if M.port then close_port(M.port) end
   M.pairing_active = false
   M.expires = 0
@@ -185,7 +174,6 @@ function M.deny_index(i, reason)
     local frame = Net.wrap(sess, { type="JOIN_WELCOME", accepted=false, reason=reason or "denied" }, { dev = rec.hello.device_id })
     send_on(frame)
   else
-    -- fallback cleartext deny (pre-session)
     send_on({ type = "JOIN_WELCOME", accepted = false, reason = reason or "denied" })
   end
   table.remove(M.pending, i)
@@ -195,9 +183,7 @@ end
 
 local function handle_join_hello(msg)
   if not M.pairing_active or not M.port then return end
-
   local dev_id = msg.device_id or -1
-  if DEBUG then print(("[JoinService] JOIN_HELLO from dev=%s"):format(tostring(dev_id))) end
 
   local q = M.quarantine[dev_id]
   if q and q > now() then
@@ -223,34 +209,37 @@ local function handle_join_hello(msg)
     return
   end
 
-  -- Build WELCOME_SEED and create session
+  -- Send seed and create session
   local seed = HS.build_welcome_seed(dev_id, M.code, msg.nonceW)
   send_on(seed)
-
-  -- Derive session
   local sess = HS.derive_pair_session(M.code, dev_id, msg.nonceW, seed.nonceM, Net)
   M.sessions[dev_id] = sess
 
-  -- Push to pending and send encrypted ACK
   push_pending(msg)
   local ack = Net.wrap(sess, { type="JOIN_ACK", queued=true }, { dev = dev_id })
   send_on(ack)
 end
 
 local function handle_modem_message(side, channel, replyChannel, msg, dist)
-  if DEBUG then
-    local ty = (type(msg)=="table" and msg.type) or type(msg)
-    print(("[JoinService] RX side=%s ch=%s reply=%s dist=%s type=%s active=%s port=%s")
-      :format(tostring(side), tostring(channel), tostring(replyChannel), tostring(dist), tostring(ty), tostring(M.pairing_active), tostring(M.port)))
-  end
   Log.info("pairing", ("RX ch=%s type=%s"):format(tostring(channel), (type(msg)=="table" and msg.type) or type(msg)))
-  if not M.pairing_active then return end
-  if not M.port or channel ~= M.port then return end
-  if type(msg) ~= "table" then return end
-  if msg.type == "JOIN_HELLO" then
-    handle_join_hello(msg)
-  else
-    -- Encrypted frames may arrive here too; ignore until approved (only ACK+WELCOME are used).
+  if not M.pairing_active then
+    -- Always respond to PAIR_PROBE to help clients align, even if pairing not active
+    if type(msg)=="table" and msg.type=="PAIR_PROBE" and channel==M.port then
+      send_on({ type = "PAIR_READY", port = M.port })
+    end
+    return
+  end
+  if not M.port or channel ~= M.port then
+    -- If probe arrives on a different channel, ignore
+    return
+  end
+
+  if type(msg)=="table" then
+    if msg.type == "JOIN_HELLO" then
+      handle_join_hello(msg)
+    elseif msg.type == "PAIR_PROBE" then
+      send_on({ type="PAIR_READY", port=M.port })
+    end
   end
 end
 
@@ -275,5 +264,9 @@ function M.run()
     end
   end
 end
+
+function M.get_active_code()  return M.pairing_active and M.code or nil end
+function M.get_active_port()  return M.pairing_active and M.port or nil end
+function M.get_pending()      return M.pending end
 
 return M

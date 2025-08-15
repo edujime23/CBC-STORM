@@ -1,5 +1,4 @@
 -- /storm/core/kernel.lua
--- Controller entrypoint: UI and JoinService run concurrently.
 package.path = "/?.lua;/?/init.lua;" .. package.path
 
 local UI   = require("/storm/modules/ui")

@@ -1,30 +1,11 @@
 -- /storm/encryption/handshake.lua
--- Pairing handshake (no ECDH yet):
---  1) Worker -> Master: JOIN_HELLO {dev_id, kind, nonceW, mac=HMAC(code, dev_id|nonceW)}
---  2) Master -> Worker: WELCOME_SEED {nonceM, mac=HMAC(code, dev_id|nonceW|nonceM)}
---  3) Both derive session = HKDF(code, nonceW||nonceM); further messages ENC via NetSec.
-
 local U = require("/storm/lib/utils")
 local Crypto = require("/storm/encryption/crypto")
 
 local DEBUG = true
 local HS = {}
 
-local function poor_hash(s)
-  local h = 0
-  for i = 1, #s do h = (h * 131 + string.byte(s, i)) % 0x7fffffff end
-  return ("%08x"):format(h)
-end
-
-local function uuid()
-  local b = Crypto.random(16)
-  local t = {}
-  for i = 1, #b do t[#t+1] = ("%02x"):format(string.byte(b, i)) end
-  return table.concat(t)
-end
-
 local function code_bytes(code, dev_id)
-  -- derive bytes from code+dev_id to avoid raw 4-digit as KDF IKM
   return Crypto.sha256(tostring(code) .. ":" .. tostring(dev_id))
 end
 
@@ -88,13 +69,12 @@ end
 
 function HS.derive_pair_session(code, dev_id, nonceW, nonceM, NetSec)
   local key = code_bytes(code, dev_id)
-  local sess = NetSec.derive_session(key, nonceW, nonceM)
-  return sess
+  return NetSec.derive_session(key, nonceW, nonceM)
 end
 
 function HS.issue_lease(worker_info, ttl_ms, policy)
   local lease = {
-    lease_id = uuid(),
+    lease_id = Crypto.hex(Crypto.random(8)),
     node_id = worker_info.device_id or 0,
     node_kind = worker_info.node_kind or "worker",
     issued_ms = U.now_ms(),

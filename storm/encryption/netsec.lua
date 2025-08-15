@@ -1,44 +1,31 @@
 -- /storm/encryption/netsec.lua
--- Encrypted frames (ETM): ChaCha20-CTR (stream) + HMAC-SHA256(tag).
--- Session key is derived via HKDF from handshake code + nonces.
--- Nonce = 12 bytes: 4-byte salt || 8-byte seq (big-endian).
--- Tag = HMAC-SHA256(k_mac, aad || nonce || ciphertext), truncated 16 bytes.
-
+-- Encrypted frames (ETM): ChaCha20-CTR + HMAC-SHA256(tag).
+-- Session from HKDF(code, nonceW||nonceM).
 local U = require("/storm/lib/utils")
 local C = require("/storm/encryption/crypto")
-local L = require("/storm/lib/logger")
 
 local NetSec = {}
 
 local function trunc16(s) return string.sub(s, 1, 16) end
 
-local function be8(n) -- uint64 BE
+local function be8(n)
   local t={}
   for i=7,0,-1 do t[#t+1]=string.char(bit32.band(bit32.rshift(n, i*8),255)) end
   return table.concat(t)
 end
 
 local function build_nonce(salt4, seq64)
-  -- 12 bytes: salt4 || seq(8)
   return salt4 .. be8(seq64)
 end
 
-function NetSec.derive_session(code_bytes, nonceW, nonceM)
-  -- HKDF: prk = HMAC(salt=nonceW..nonceM, IKM=code_bytes)
-  local prk = C.hkdf_extract(nonceW..nonceM, code_bytes)
+function NetSec.derive_session(key_ikm, nonceW, nonceM)
+  local prk = C.hkdf_extract(nonceW..nonceM, key_ikm)
   local okm = C.hkdf_expand(prk, "CBC-STORM/PAIR", 64)
   local k_master = string.sub(okm,1,32)
   local nonce_salt4 = string.sub(okm,33,36)
-  -- Split into enc/mac
   local k_enc = C.hmac_sha256(k_master, "enc")
   local k_mac = C.hmac_sha256(k_master, "mac")
-  return {
-    k_enc = k_enc,
-    k_mac = k_mac,
-    salt4 = nonce_salt4,
-    seq_tx = 0,
-    seq_rx = -1, -- last accepted
-  }
+  return { k_enc=k_enc, k_mac=k_mac, salt4=nonce_salt4, seq_tx=0, seq_rx=-1 }
 end
 
 local function aead_encrypt(sess, aad, plaintext)
@@ -50,14 +37,9 @@ local function aead_encrypt(sess, aad, plaintext)
 end
 
 local function aead_decrypt(sess, aad, seq, nonce, ct, tag)
-  -- replay/basic reordering window: require seq > last
-  if seq <= (sess.seq_rx or -1) then
-    return nil, "replay"
-  end
+  if seq <= (sess.seq_rx or -1) then return nil, "replay" end
   local mac = C.hmac_sha256(sess.k_mac, (aad or "") .. nonce .. ct)
-  if trunc16(mac) ~= tag then
-    return nil, "bad_tag"
-  end
+  if trunc16(mac) ~= tag then return nil, "bad_tag" end
   local pt = C.chacha20_xor(sess.k_enc, nonce, 1, ct)
   sess.seq_rx = seq
   return pt

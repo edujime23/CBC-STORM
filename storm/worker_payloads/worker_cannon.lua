@@ -1,6 +1,4 @@
 -- /storm/worker_payloads/worker_cannon.lua
--- Cannon Worker entrypoint: detect cannon, pair, then await controller commands (later).
-
 local Common = require("/storm/worker_payloads/worker_common")
 
 print("CBC-STORM v4.0 — Cannon Worker")
