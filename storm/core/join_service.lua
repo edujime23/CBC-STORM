@@ -1,12 +1,12 @@
 -- /storm/core/join_service.lua
--- Secure pairing on operator-chosen port; no terminal spam; logs to /storm/journal/pairing.log
+-- Secure pairing on operator-chosen port; logs to /storm/journal/pairing.log
 local U   = require("/storm/lib/utils")
 local Cfg = require("/storm/lib/config_loader")
 local Log = require("/storm/lib/logger")
 local HS  = require("/storm/encryption/handshake")
 local Net = require("/storm/encryption/netsec")
 
-local DEBUG = false  -- set true only for one-off debugging
+local DEBUG = false  -- set true only for debugging
 
 local M = {
   pairing_active   = false,
@@ -18,6 +18,7 @@ local M = {
   attempts         = {},
   quarantine       = {},
   _modem           = nil,
+  _modem_name      = nil,
   _last_ready_ms   = 0,
   sessions         = {}
 }
@@ -27,18 +28,42 @@ local function cfg_quarantine_ttl() return (Cfg.security and Cfg.security.quaran
 local function cfg_pairing_window() return (Cfg.system and Cfg.system.join_psk_window_s and Cfg.system.join_psk_window_s*1000) or (5*60*1000) end
 local function now() return U.now_ms() end
 
+local function pick_wireless_modem()
+  local names = peripheral.getNames()
+  local first_modem = nil
+  for _, name in ipairs(names) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m then
+        local isW = (m.isWireless and m.isWireless()) and true or false
+        if isW then
+          M._modem = m
+          M._modem_name = name
+          if DEBUG then print(("[JoinService] Selected wireless modem: %s"):format(name)) end
+          return m
+        end
+        -- remember first modem (non-wireless) just for info
+        if not first_modem then first_modem = { obj=m, name=name } end
+      end
+    end
+  end
+  -- No wireless modem found: error exactly as requested
+  if first_modem then
+    error(("No wireless modem found. Found only wired modem '%s'. Attach a wireless/ender modem and retry."):format(first_modem.name))
+  else
+    error("No modem found. Attach a wireless modem.")
+  end
+end
+
 local function modem_or_error()
   if M._modem and peripheral.getName(M._modem) then return M._modem end
-  local m = peripheral.find("modem")
-  if not m then error("No modem found") end
-  M._modem = m
-  return m
+  return pick_wireless_modem()
 end
 
 local function dbg_open_channels(tag, ch)
   if not DEBUG then return end
   local m = modem_or_error()
-  print(("[JoinService][%s] isOpen(%d)=%s"):format(tag, ch, tostring(m.isOpen and m.isOpen(ch) or false)))
+  print(("[JoinService][%s][%s] isOpen(%d)=%s"):format(tag, M._modem_name or "?", ch, tostring(m.isOpen and m.isOpen(ch) or false)))
 end
 
 local function ensure_only_port_open(port)
@@ -57,7 +82,7 @@ end
 local function send_on(tbl)
   local m = modem_or_error()
   if not M.port then return end
-  Log.info("pairing", "TX on "..tostring(M.port)..": "..(type(tbl)=="table" and (tbl.type or "table") or type(tbl)))
+  Log.info("pairing", ("TX on %s/%d: %s"):format(M._modem_name or "modem", M.port, type(tbl)=="table" and (tbl.type or "table") or type(tbl)))
   m.transmit(M.port, M.port, tbl)
 end
 
@@ -81,7 +106,7 @@ local function is_port_secure(port)
   if not m.isOpen(port) then pcall(function() m.open(port) end) end
   dbg_open_channels("sniff_start", port)
 
-  print(("[JoinService] Testing port %d for noise (2s)..."):format(port))
+  print(("[JoinService] Testing port %d on %s for noise (2s)..."):format(port, M._modem_name or "?"))
   local t = os.startTimer(2.0)
   while true do
     local ev, side, channel, reply, msg, dist = os.pullEvent()
@@ -100,6 +125,11 @@ function M.start_pairing_interactive()
   M.pairing_active = false
   M.port, M.code = nil, ""
 
+  -- Ensure we have a wireless modem selected
+  modem_or_error()
+  local isW = (M._modem.isWireless and M._modem.isWireless()) and true or false
+  print(("[JoinService] Using modem '%s' (Wireless=%s)"):format(M._modem_name or "?", tostring(isW)))
+
   local pairing_port
   while true do
     pairing_port = read_number("Enter secure pairing port (0-65535): ", 0, 65535)
@@ -116,7 +146,7 @@ function M.start_pairing_interactive()
   M.attempts, M.quarantine, M.sessions, M.pending, M.approved = {}, {}, {}, {}, {}
   M._last_ready_ms = 0
 
-  Log.info("system", ("Pairing started on port %d with code %s"):format(M.port, M.code))
+  Log.info("system", ("Pairing started on %s port %d with code %s"):format(M._modem_name or "modem", M.port, M.code))
   print(("[JoinService] Pairing ARMED: port=%d code=%s"):format(M.port, M.code))
 end
 
@@ -135,7 +165,7 @@ function M.get_pending()      return M.pending end
 
 local function push_pending(hello)
   local id = ("%d-%06d"):format(hello.device_id or 0, math.random(100000, 999999))
-  local rec = { id = id, hello = hello, ch = M.port, side = "modem", ts = now() }
+  local rec = { id = id, hello = hello, ch = M.port, side = M._modem_name or "modem", ts = now() }
   table.insert(M.pending, rec)
   Log.info("system", ("Join request queued: %s (%s)"):format(id, tostring(hello.node_kind)))
 end
@@ -209,7 +239,6 @@ local function handle_join_hello(msg)
     return
   end
 
-  -- Send seed and create session
   local seed = HS.build_welcome_seed(dev_id, M.code, msg.nonceW)
   send_on(seed)
   local sess = HS.derive_pair_session(M.code, dev_id, msg.nonceW, seed.nonceM, Net)
@@ -221,19 +250,14 @@ local function handle_join_hello(msg)
 end
 
 local function handle_modem_message(side, channel, replyChannel, msg, dist)
-  Log.info("pairing", ("RX ch=%s type=%s"):format(tostring(channel), (type(msg)=="table" and msg.type) or type(msg)))
+  Log.info("pairing", ("RX on %s ch=%s type=%s"):format(M._modem_name or "modem", tostring(channel), (type(msg)=="table" and msg.type) or type(msg)))
   if not M.pairing_active then
-    -- Always respond to PAIR_PROBE to help clients align, even if pairing not active
     if type(msg)=="table" and msg.type=="PAIR_PROBE" and channel==M.port then
       send_on({ type = "PAIR_READY", port = M.port })
     end
     return
   end
-  if not M.port or channel ~= M.port then
-    -- If probe arrives on a different channel, ignore
-    return
-  end
-
+  if not M.port or channel ~= M.port then return end
   if type(msg)=="table" then
     if msg.type == "JOIN_HELLO" then
       handle_join_hello(msg)
@@ -245,6 +269,9 @@ end
 
 function M.run()
   modem_or_error()
+  print(("[JoinService] Using modem '%s' (Wireless=%s)"):format(
+    M._modem_name or "?", tostring((M._modem.isWireless and M._modem.isWireless()) and true or false)
+  ))
   while true do
     local t = os.startTimer(0.25)
     while true do
@@ -264,9 +291,5 @@ function M.run()
     end
   end
 end
-
-function M.get_active_code()  return M.pairing_active and M.code or nil end
-function M.get_active_port()  return M.pairing_active and M.port or nil end
-function M.get_pending()      return M.pending end
 
 return M

@@ -1,22 +1,40 @@
 -- /storm/worker_payloads/worker_common.lua
--- Worker pairing with PAIR_PROBE fallback + encrypted ACK/WELCOME.
+-- Require wireless modem; if none, error. Probes for PAIR_READY, then HELLO.
 
 local U   = require("/storm/lib/utils")
 local Log = require("/storm/lib/logger")
 local HS  = require("/storm/encryption/handshake")
 local Net = require("/storm/encryption/netsec")
 
-local DEBUG = false
+local M = { state = "CONNECTING", lease = nil, _modem=nil, _name=nil }
 
-local M = {
-  state = "CONNECTING",
-  lease = nil
-}
+local function pick_wireless_modem()
+  local names = peripheral.getNames()
+  local first_modem = nil
+  for _, name in ipairs(names) do
+    if peripheral.getType(name) == "modem" then
+      local m = peripheral.wrap(name)
+      if m then
+        local isW = (m.isWireless and m.isWireless()) and true or false
+        if isW then
+          M._modem, M._name = m, name
+          print(("[Worker] Using wireless modem '%s'"):format(name))
+          return m
+        end
+        if not first_modem then first_modem = { obj=m, name=name } end
+      end
+    end
+  end
+  if first_modem then
+    error(("No wireless modem found. Found only wired modem '%s'. Attach a wireless/ender modem."):format(first_modem.name))
+  else
+    error("No modem found. Attach a wireless modem.")
+  end
+end
 
 local function modem_or_error()
-  local m = peripheral.find("modem")
-  if not m then error("No modem found") end
-  return m
+  if M._modem and peripheral.getName(M._modem) then return M._modem end
+  return pick_wireless_modem()
 end
 
 local function read_number(prompt, minv, maxv)
@@ -42,13 +60,14 @@ function M.init()
   Log.info("worker", "Init common worker")
   local m = peripheral.find("modem")
   if m and m.closeAll then pcall(function() m.closeAll() end) end
+  modem_or_error() -- ensure wireless modem
 end
 
 function M.find_pairing()
   local modem = modem_or_error()
   local port = read_number("Enter pairing port provided by master: ", 0, 65535)
   if not modem.isOpen(port) then pcall(function() modem.open(port) end) end
-  print("[Worker] Using port " .. tostring(port) .. " for pairing.")
+  print(("[Worker] Using modem '%s' on port %d for pairing."):format(M._name or "modem", port))
   return { channel = port, beacon = { cluster_id = "manual" } }
 end
 
@@ -60,7 +79,6 @@ function M.onboard(node_kind, caps, join_info)
   if not modem.isOpen(ch) then pcall(function() modem.open(ch) end) end
   print(("[Worker] isOpen(%d)=%s"):format(ch, tostring(modem.isOpen and modem.isOpen(ch) or false)))
 
-  -- Pre-listen for PAIR_READY (1.0s)
   local function listen_for_ready(timeout_s)
     local t = os.startTimer(timeout_s or 1.0)
     while true do
@@ -75,18 +93,11 @@ function M.onboard(node_kind, caps, join_info)
 
   local saw_ready = listen_for_ready(1.0)
   if not saw_ready then
-    -- Send PAIR_PROBE 3x, 100ms apart
-    for i=1,3 do
-      modem.transmit(ch, ch, { type="PAIR_PROBE", dev=os.getComputerID() })
-      U.sleep_ms(100)
-    end
+    for i=1,3 do modem.transmit(ch, ch, { type="PAIR_PROBE", dev=os.getComputerID() }); U.sleep_ms(100) end
     saw_ready = listen_for_ready(1.0)
-    if not saw_ready then
-      print("[Worker] No PAIR_READY seen. Continuing anyway.")
-    end
+    if not saw_ready then print("[Worker] No PAIR_READY seen. Continuing anyway.") end
   end
 
-  -- Build HELLO
   local hello = HS.build_join_hello({
     node_kind = node_kind,
     device_id = os.getComputerID(),
