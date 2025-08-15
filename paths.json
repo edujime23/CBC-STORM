@@ -1,0 +1,50 @@
+{
+  "repo": "https://raw.githubusercontent.com/edujime23/CBC-STORM/main/",
+  "version_file": "version.json",
+  "node_types": {
+    "controller": {
+      "description": "Full installation for a master/controller node.",
+      "files": [
+        "storm/core/kernel.lua",
+        "storm/core/consensus.lua",
+        "storm/core/network.lua",
+        "storm/core/federation.lua",
+        "storm/core/resurrection.lua",
+        "storm/core/alliance.lua",
+        "storm/core/orders.lua",
+        "storm/core/safety.lua",
+        "storm/modules/cannon_control.lua",
+        "storm/modules/player_detect.lua",
+        "storm/modules/targeting.lua",
+        "storm/modules/iff.lua",
+        "storm/modules/dimensional.lua",
+        "storm/modules/portal_tracker.lua",
+        "storm/modules/time_sync.lua",
+        "storm/modules/ui.lua",
+        "storm/lib/utils.lua",
+        "storm/lib/logger.lua",
+        "storm/lib/config_loader.lua",
+        "storm/lib/crypto.lua",
+        "storm/worker_payloads/worker_cannon.lua",
+        "storm/worker_payloads/worker_detector.lua",
+        "storm/worker_payloads/worker_netlib.lua",
+        "storm/update.lua"
+      ]
+    },
+    "worker": {
+      "description": "Minimal bootstrap script for a worker node.",
+      "files": [
+        "register.lua",
+        "storm/lib/crypto.lua"
+      ]
+    },
+    "seed": {
+      "description": "Recovery files for a dormant seed node.",
+      "files": [
+        "seed/bootstrap.lua",
+        "seed/lib/decompress.lua",
+        "seed/lib/decrypt.lua"
+      ]
+    }
+  }
+}
