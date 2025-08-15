@@ -11,10 +11,9 @@ local M = {
   pairing_active = false,
   expires = 0,
   code = "",
-  pending = {},     -- { {id, hello, ch, side, ts} }
-  approved = {},    -- accepted records for registry (future)
+  pending = {},
+  approved = {},
   _modem = nil,
-  _current_ch = nil,
   _last_beacon_ms = 0
 }
 
@@ -50,11 +49,6 @@ end
 
 function M.get_pending()
   return M.pending
-end
-
-local function beacon_channel()
-  local window = (C.network and C.network.fh_window_ms and C.network.fh_window_ms.idle) or 5000
-  return H.schedule("join_secret", "join", currentEpoch(window), C.system.cluster_id)
 end
 
 local function ensure_channel_open(ch)
@@ -111,19 +105,22 @@ local function broadcast_beacon()
     return
   end
 
-  local ch = beacon_channel()
-  M._current_ch = ch
-  ensure_channel_open(ch)
+  -- Use shared salt "global" so workers can compute the same channels without knowing cluster_id
+  local window = (C.network and C.network.fh_window_ms and C.network.fh_window_ms.idle) or 5000
+  local e = currentEpoch(window)
+  local ch_cur  = H.schedule("join_secret", "join", e,   "global")
+  local ch_next = H.schedule("join_secret", "join", e+1, "global") -- drift tolerance
 
   if now() - (M._last_beacon_ms or 0) > 500 then
     local beacon = {
       type = "PAIR_BEACON",
       cluster_id = C.system.cluster_id,
       dimension = C.system.dimension,
-      epoch = currentEpoch((C.network.fh_window_ms and C.network.fh_window_ms.idle) or 5000),
+      epoch = e,
       hint = "enter code on worker"
     }
-    send_on(ch, beacon)
+    send_on(ch_cur,  beacon)
+    send_on(ch_next, beacon)
     M._last_beacon_ms = now()
   end
 end
@@ -131,9 +128,7 @@ end
 local function handle_modem_message(side, ch, rch, msg, dist)
   if type(msg) ~= "table" then return end
   if msg.type == "JOIN_HELLO" then
-    if not M.pairing_active then
-      return
-    end
+    if not M.pairing_active then return end
     local ok, err = HS.verify_join_hello(msg, M.code)
     if not ok then
       L.warn("system", "Rejected JOIN_HELLO: " .. tostring(err))
@@ -144,8 +139,7 @@ local function handle_modem_message(side, ch, rch, msg, dist)
 end
 
 function M.run()
-  -- Event loop: beacon + JOIN_HELLO intake
-  local m = modem_or_error()
+  modem_or_error()
   while true do
     local t = os.startTimer(0.25)
     while true do
