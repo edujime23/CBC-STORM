@@ -7,12 +7,9 @@ local Join = require("/storm/core/join_service")
 local U    = require("/storm/lib/utils")
 
 local M = {}
-
--- Internal flag: when true, we suspend the bottom status ticker to avoid cursor jumps.
 M.suspend_ticks = false
 
 local function safe_write_line(y, text)
-  -- Preserve cursor + colors while drawing UI
   local cx, cy = term.getCursorPos()
   local oldBG, oldFG = term.getBackgroundColor(), term.getTextColor()
   term.setCursorPos(1, y)
@@ -48,10 +45,8 @@ local function pairing_info()
 end
 
 local function approvals_screen()
-  -- Suspend ticker during interactive input
   M.suspend_ticks = true
   term.clear(); header()
-
   local _, h = term.getSize()
   while true do
     term.setCursorPos(1, 3); term.clearLine(); term.write("Pending join requests:")
@@ -71,7 +66,6 @@ local function approvals_screen()
     term.setCursorPos(1, h - 1); term.clearLine(); term.write("> ")
     local inp = read()
     if inp == "" then
-      -- refresh
     elseif inp == "\27" then
       break
     elseif inp:match("^%d+$") then
@@ -82,8 +76,6 @@ local function approvals_screen()
       if not Join.deny_index(idx) then L.warn("system", "Deny failed: invalid index") end
     end
   end
-
-  -- Resume ticker
   M.suspend_ticks = false
   term.clear(); header(); footer(); pairing_info()
 end
@@ -93,9 +85,8 @@ function M.run()
 
   local function key_loop()
     while true do
-      local _, k = os.pullEvent("key") -- Important: only consume key events
+      local _, k = os.pullEvent("key") -- only key events; don't consume modem_message
       if k == keys.p then
-        -- Suspend ticker during Join.start_pairing_interactive (it uses read)
         M.suspend_ticks = true
         term.setCursorPos(1, 3); term.clearLine(); print("SECURE PAIRING SETUP")
         Join.start_pairing_interactive()

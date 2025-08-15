@@ -1,5 +1,5 @@
 -- /storm/worker_payloads/worker_common.lua
--- Worker pairing: ask for port and 4-digit code, no discovery, heavy debug.
+-- Worker pairing: ask for port and 4-digit code, no discovery, heavy debug + pre-listen.
 
 local U  = require("/storm/lib/utils")
 local L  = require("/storm/lib/logger")
@@ -62,6 +62,27 @@ function M.onboard(node_kind, caps, join_info)
   if not modem.isOpen(ch) then pcall(function() modem.open(ch) end) end
   print(("[Worker] isOpen(%d)=%s"):format(ch, tostring(modem.isOpen and modem.isOpen(ch) or false)))
 
+  -- Pre-listen for PAIR_READY to validate connectivity (1.5s)
+  local pre_t = os.startTimer(1.5)
+  local saw_ready = false
+  while true do
+    local ev, side, channel, replyCh, msg, dist = os.pullEvent()
+    if ev == "timer" and side == pre_t then
+      break
+    elseif ev == "modem_message" then
+      local ty = (type(msg)=="table" and msg.type) or type(msg)
+      if DEBUG then print(("[Worker] PRE-RX ch=%s type=%s"):format(tostring(channel), tostring(ty))) end
+      if channel == ch and type(msg)=="table" and msg.type=="PAIR_READY" then
+        print("[Worker] Master PAIR_READY seen. Link OK.")
+        saw_ready = true
+        -- don't break; continue until timer to soak noise
+      end
+    end
+  end
+  if not saw_ready then
+    print("[Worker] No PAIR_READY seen. Link may be out of range or master not armed.")
+  end
+
   local hello = HS.build_join_hello({
     node_kind = node_kind,
     device_id = os.getComputerID(),
@@ -90,7 +111,7 @@ function M.onboard(node_kind, caps, join_info)
         if type(msg) == "table" then
           if msg.type == "JOIN_ACK" and msg.queued then
             print("[Worker] Master queued request for approval...")
-            timer = os.startTimer(60) -- extend wait window
+            timer = os.startTimer(60)
           elseif msg.type == "JOIN_DENY" then
             if msg.reason == "quarantine" or msg.reason == "attempts_exceeded" then
               if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
@@ -116,11 +137,7 @@ function M.onboard(node_kind, caps, join_info)
             else
               return false, msg.reason or "denied"
             end
-          else
-            print("[Worker] Unexpected table message during pairing: "..tostring(msg.type))
           end
-        else
-          print("[Worker] Unexpected non-table message during pairing")
         end
       end
     end

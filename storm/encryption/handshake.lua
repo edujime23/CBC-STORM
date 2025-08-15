@@ -1,6 +1,4 @@
 -- /storm/encryption/handshake.lua
--- Onboarding + simple lease issuance (skeleton). Adds debug prints.
-
 local U = require("/storm/lib/utils")
 local Crypto = require("/storm/encryption/crypto")
 
@@ -20,14 +18,13 @@ local function uuid()
   return table.concat(t)
 end
 
--- Worker-side: build JOIN_HELLO
 function M.build_join_hello(opts)
   local hello = {
     type = "JOIN_HELLO",
     node_kind = opts.node_kind or "worker",
     device_id = opts.device_id or os.getComputerID(),
     nonce = poor_hash(uuid() .. tostring(os.clock())),
-    code = opts.code, -- plaintext for now
+    code = opts.code,
     caps = opts.caps or {},
     ts = U.now_ms()
   }
@@ -38,7 +35,6 @@ function M.build_join_hello(opts)
   return hello
 end
 
--- Master-side: verify JOIN_HELLO
 function M.verify_join_hello(hello, active_code)
   if type(hello) ~= "table" or hello.type ~= "JOIN_HELLO" then
     if DEBUG then print("[Handshake] verify: bad_msg") end
@@ -56,7 +52,6 @@ function M.verify_join_hello(hello, active_code)
   return true
 end
 
--- Master-side: create capability lease
 function M.issue_lease(worker_info, ttl_ms, policy)
   local lease = {
     lease_id = uuid(),

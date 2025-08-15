@@ -1,10 +1,10 @@
 -- /storm/core/join_service.lua
--- Secure pairing (operator-chosen port, no discovery) with heavy debug.
+-- Secure pairing (operator-chosen port, no discovery) + heavy debug + PAIR_READY ping.
 
 local U  = require("/storm/lib/utils")
 local C  = require("/storm/lib/config_loader")
 local L  = require("/storm/lib/logger")
-local HS = require("/storm/encryption/handshake")
+local HS = require("/storm/encryption/handshake") -- no crypto used; only code check
 
 local DEBUG = true
 
@@ -18,6 +18,7 @@ local M = {
   attempts         = {},
   quarantine       = {},
   _modem           = nil,
+  _last_ready_ms   = 0
 }
 
 local function cfg_attempt_limit() return (C.security and C.security.pairing_attempt_limit) or 4 end
@@ -93,8 +94,8 @@ local function is_port_secure(port)
       if channel == port then
         print(("[JoinService] Noise detected: ch=%d reply=%s type=%s dist=%s"):format(channel, tostring(reply), type(msg)=="table" and (msg.type or "table") or type(msg), tostring(dist)))
         return false
-      else
-        if DEBUG then print(("[JoinService] Ignored traffic: ch=%d (not %d)"):format(channel, port)) end
+      elseif DEBUG then
+        print(("[JoinService] Ignored traffic: ch=%d (not %d)"):format(channel, port))
       end
     end
   end
@@ -120,6 +121,7 @@ function M.start_pairing_interactive()
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
   M.attempts, M.quarantine = {}, {}
+  M._last_ready_ms = 0
 
   L.info("system", ("Pairing started on port %d with code %s"):format(M.port, M.code))
   print(("[JoinService] Pairing ARMED: port=%d code=%s"):format(M.port, M.code))
@@ -221,9 +223,6 @@ local function handle_modem_message(side, channel, replyChannel, msg, dist)
   if type(msg) ~= "table" then return end
   if msg.type == "JOIN_HELLO" then
     handle_join_hello(msg)
-  else
-    L.warn("system", ("Unexpected traffic on pairing port %d; closing pairing"):format(M.port))
-    M.stop_pairing()
   end
 end
 
@@ -236,6 +235,13 @@ function M.run()
       if ev == "timer" and p1 == t then break
       elseif ev == "modem_message" then handle_modem_message(p1, p2, p3, p4, p5) end
     end
+
+    -- Send a small READY ping once per second on the chosen port (for connectivity debug only)
+    if M.pairing_active and M.port and (now() - (M._last_ready_ms or 0) > 1000) then
+      send_on({ type = "PAIR_READY", port = M.port })
+      M._last_ready_ms = now()
+    end
+
     if M.pairing_active and now() > (M.expires or 0) then
       L.info("system", "Pairing window expired")
       M.stop_pairing()
