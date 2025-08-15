@@ -1,14 +1,12 @@
 -- /storm/core/join_service.lua
--- Secure pairing with operator-chosen port, no discovery, 4-digit code, limited attempts, quarantine.
--- Fixes:
---  - Port sniff window = 2 seconds
---  - Correct modem_message param usage (channel vs replyChannel)
---  - Debug prints on receive
+-- Secure pairing (operator-chosen port, no discovery) with heavy debug.
 
 local U  = require("/storm/lib/utils")
 local C  = require("/storm/lib/config_loader")
 local L  = require("/storm/lib/logger")
 local HS = require("/storm/encryption/handshake")
+
+local DEBUG = true
 
 local M = {
   pairing_active   = false,
@@ -17,10 +15,9 @@ local M = {
   port             = nil,
   pending          = {},
   approved         = {},
-  attempts         = {},   -- attempts[device_id] = count
-  quarantine       = {},   -- quarantine[device_id] = until_ms
+  attempts         = {},
+  quarantine       = {},
   _modem           = nil,
-  _last_info_ms    = 0
 }
 
 local function cfg_attempt_limit() return (C.security and C.security.pairing_attempt_limit) or 4 end
@@ -35,28 +32,37 @@ local function modem_or_error()
   M._modem = m
   local name = peripheral.getName(m) or "modem"
   local wireless = (m.isWireless and m.isWireless()) and "true" or "false"
-  print(("[JoinService] Modem: %s | Wireless: %s"):format(name, wireless))
+  if DEBUG then print(("[JoinService] Modem: %s | Wireless: %s"):format(name, wireless)) end
   return m
+end
+
+local function dbg_open_channels(tag, ch)
+  local m = modem_or_error()
+  if DEBUG then
+    print(("[JoinService][%s] isOpen(%d)=%s"):format(tag, ch, tostring(m.isOpen and m.isOpen(ch) or false)))
+  end
 end
 
 local function ensure_only_port_open(port)
   local m = modem_or_error()
   if m.closeAll then pcall(function() m.closeAll() end) end
   if not m.isOpen(port) then pcall(function() m.open(port) end) end
+  dbg_open_channels("ensure_only_port_open", port)
 end
 
 local function close_port(port)
   local m = modem_or_error()
   if port and m.isOpen(port) then pcall(function() m.close(port) end) end
+  dbg_open_channels("close_port", port)
 end
 
 local function send_on(tbl)
   local m = modem_or_error()
   if not M.port then return end
+  if DEBUG then print(("[JoinService] TX on %d: %s"):format(M.port, type(tbl)=="table" and (tbl.type or "table") or tostring(tbl))) end
   m.transmit(M.port, M.port, tbl)
 end
 
--- UI helpers
 local function read_number(prompt, minv, maxv)
   while true do
     term.setCursorPos(1, 4); term.clearLine(); io.write(prompt)
@@ -71,23 +77,24 @@ local function generate_code4()
   return ("%04d"):format(math.random(0, 9999))
 end
 
--- Sniff 2 seconds for any traffic on the port
 local function is_port_secure(port)
   local m = modem_or_error()
   if m.closeAll then pcall(function() m.closeAll() end) end
   if not m.isOpen(port) then pcall(function() m.open(port) end) end
+  dbg_open_channels("sniff_start", port)
 
   print(("[JoinService] Testing port %d for noise (2s)..."):format(port))
   local t = os.startTimer(2.0)
   while true do
-    local ev, p1, p2, p3, p4, p5 = os.pullEvent()
-    if ev == "timer" and p1 == t then
+    local ev, side, channel, reply, msg, dist = os.pullEvent()
+    if ev == "timer" and side == t then
       break
     elseif ev == "modem_message" then
-      local side, channel, reply, msg, dist = p1, p2, p3, p4, p5
       if channel == port then
-        print("[JoinService] Traffic detected on chosen port. Not secure.")
+        print(("[JoinService] Noise detected: ch=%d reply=%s type=%s dist=%s"):format(channel, tostring(reply), type(msg)=="table" and (msg.type or "table") or type(msg), tostring(dist)))
         return false
+      else
+        if DEBUG then print(("[JoinService] Ignored traffic: ch=%d (not %d)"):format(channel, port)) end
       end
     end
   end
@@ -108,16 +115,18 @@ function M.start_pairing_interactive()
 
   ensure_only_port_open(pairing_port)
 
-  M.port   = pairing_port
-  M.code   = generate_code4()
+  M.port    = pairing_port
+  M.code    = generate_code4()
   M.expires = now() + cfg_pairing_window()
   M.pairing_active = true
   M.attempts, M.quarantine = {}, {}
 
   L.info("system", ("Pairing started on port %d with code %s"):format(M.port, M.code))
+  print(("[JoinService] Pairing ARMED: port=%d code=%s"):format(M.port, M.code))
 end
 
 function M.stop_pairing()
+  if DEBUG then print("[JoinService] stop_pairing()") end
   if M.port then close_port(M.port) end
   M.pairing_active = false
   M.expires = 0
@@ -170,6 +179,8 @@ local function handle_join_hello(msg)
   if not M.pairing_active or not M.port then return end
 
   local dev_id = msg.device_id or -1
+  if DEBUG then print(("[JoinService] JOIN_HELLO from dev=%s code=%s"):format(tostring(dev_id), tostring(msg.code))) end
+
   local q = M.quarantine[dev_id]
   if q and q > now() then
     send_on({ type = "JOIN_DENY", reason = "quarantine", until_ms = q })
@@ -200,6 +211,11 @@ local function handle_join_hello(msg)
 end
 
 local function handle_modem_message(side, channel, replyChannel, msg, dist)
+  if DEBUG then
+    local ty = (type(msg)=="table" and msg.type) or type(msg)
+    print(("[JoinService] RX side=%s ch=%s reply=%s dist=%s type=%s active=%s port=%s")
+      :format(tostring(side), tostring(channel), tostring(replyChannel), tostring(dist), tostring(ty), tostring(M.pairing_active), tostring(M.port)))
+  end
   if not M.pairing_active then return end
   if not M.port or channel ~= M.port then return end
   if type(msg) ~= "table" then return end

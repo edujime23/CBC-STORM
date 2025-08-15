@@ -1,11 +1,11 @@
 -- /storm/worker_payloads/worker_common.lua
--- Worker pairing: ask for port, then 4-digit code, no discovery.
--- Fixes:
---  - Reset wait timer when JOIN_ACK (queued) is received to avoid timeouts during manual approval.
+-- Worker pairing: ask for port and 4-digit code, no discovery, heavy debug.
 
 local U  = require("/storm/lib/utils")
 local L  = require("/storm/lib/logger")
 local HS = require("/storm/encryption/handshake")
+
+local DEBUG = true
 
 local M = {
   state = "CONNECTING",
@@ -56,11 +56,11 @@ end
 
 function M.onboard(node_kind, caps, join_info)
   local code4 = read_code4("Enter 4-digit code: ")
-
   local modem = modem_or_error()
   local ch = join_info.channel
   if modem.closeAll then pcall(function() modem.closeAll() end) end
   if not modem.isOpen(ch) then pcall(function() modem.open(ch) end) end
+  print(("[Worker] isOpen(%d)=%s"):format(ch, tostring(modem.isOpen and modem.isOpen(ch) or false)))
 
   local hello = HS.build_join_hello({
     node_kind = node_kind,
@@ -68,51 +68,61 @@ function M.onboard(node_kind, caps, join_info)
     code = code4,
     caps = caps or {}
   })
-  print(("[Worker] Sending JOIN_HELLO on ch %d..."):format(ch))
+
+  print(("[Worker] TX JOIN_HELLO on ch %d (dev=%s code=%s)"):format(ch, tostring(hello.device_id), tostring(hello.code)))
   modem.transmit(ch, ch, hello)
 
-  local timer = os.startTimer(12)  -- initial wait for ACK
+  -- Wait long enough for operator approval
+  local timer = os.startTimer(60)
   while true do
-    local ev, p1, p2, p3, p4, p5 = os.pullEvent()
-    if ev == "timer" and p1 == timer then
+    local ev, side, channel, replyCh, msg, dist = os.pullEvent()
+    if ev == "timer" and side == timer then
       if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
       return false, "timeout"
     elseif ev == "modem_message" then
-      local side, channel, replyCh, msg, dist = p1, p2, p3, p4, p5
-      if channel ~= ch or type(msg) ~= "table" then goto continue end
-
-      if msg.type == "JOIN_DENY" then
-        if msg.reason == "quarantine" or msg.reason == "attempts_exceeded" then
-          if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-          return false, msg.reason
-        elseif msg.reason == "bad_code" then
-          print("Bad code. Attempts left: " .. tostring(msg.attempts_left or 0))
-          local c2 = read_code4("Enter 4-digit code (retry): ")
-          hello.code = c2
-          modem.transmit(ch, ch, hello)
-          timer = os.startTimer(12)
+      if DEBUG then
+        local ty = (type(msg)=="table" and msg.type) or type(msg)
+        print(("[Worker] RX side=%s ch=%s reply=%s dist=%s type=%s"):format(tostring(side), tostring(channel), tostring(replyCh), tostring(dist), tostring(ty)))
+      end
+      if channel ~= ch then
+        if DEBUG then print(("[Worker] Ignoring message on ch %s (expected %s)"):format(tostring(channel), tostring(ch))) end
+      else
+        if type(msg) == "table" then
+          if msg.type == "JOIN_ACK" and msg.queued then
+            print("[Worker] Master queued request for approval...")
+            timer = os.startTimer(60) -- extend wait window
+          elseif msg.type == "JOIN_DENY" then
+            if msg.reason == "quarantine" or msg.reason == "attempts_exceeded" then
+              if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+              return false, msg.reason
+            elseif msg.reason == "bad_code" then
+              print("Bad code. Attempts left: " .. tostring(msg.attempts_left or 0))
+              local c2 = read_code4("Enter 4-digit code (retry): ")
+              hello.code = c2
+              print("[Worker] Re-TX JOIN_HELLO with new code")
+              modem.transmit(ch, ch, hello)
+              timer = os.startTimer(60)
+            else
+              if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+              return false, "denied"
+            end
+          elseif msg.type == "JOIN_WELCOME" then
+            if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
+            if msg.accepted then
+              M.lease = msg.lease
+              M.state = "ESTABLISHED"
+              print("Paired. Lease: " .. tostring(M.lease.lease_id))
+              return true
+            else
+              return false, msg.reason or "denied"
+            end
+          else
+            print("[Worker] Unexpected table message during pairing: "..tostring(msg.type))
+          end
         else
-          if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-          return false, "denied"
-        end
-
-      elseif msg.type == "JOIN_ACK" and msg.queued then
-        print("Request queued for approval...")
-        timer = os.startTimer(60) -- extend wait while operator approves
-
-      elseif msg.type == "JOIN_WELCOME" then
-        if modem.isOpen(ch) then pcall(function() modem.close(ch) end) end
-        if msg.accepted then
-          M.lease = msg.lease
-          M.state = "ESTABLISHED"
-          print("Paired. Lease: " .. tostring(M.lease.lease_id))
-          return true
-        else
-          return false, msg.reason or "denied"
+          print("[Worker] Unexpected non-table message during pairing")
         end
       end
-
-      ::continue::
     end
   end
 end
