@@ -1,11 +1,12 @@
 -- /storm/core/join_service.lua
--- Secure pairing on operator-chosen port; worker registry; encrypted command plane.
+-- Secure pairing on operator-chosen port; worker registry persists to /storm/state/registry.json.
 local U   = require("/storm/lib/utils")
 local Cfg = require("/storm/lib/config_loader")
 local Log = require("/storm/lib/logger")
 local HS  = require("/storm/encryption/handshake")
 local Net = require("/storm/encryption/netsec")
 
+local REGISTRY_PATH = "/storm/state/registry.json"
 local DEBUG = false
 
 local M = {
@@ -21,8 +22,42 @@ local M = {
   _modem_name      = nil,
   _last_ready_ms   = 0,
   sessions         = {},   -- dev_id -> session
-  registry         = {},   -- dev_id -> {dev_id, lease, modem, channel, last_rtt, last_ping_ts, last_status}
+  registry         = {}    -- dev_id -> {dev_id, lease, modem, channel, last_rtt, last_ping_ts, last_status}
 }
+
+-- Load/save registry
+local function save_registry()
+  local to_save = {}
+  for dev_id, rec in pairs(M.registry) do
+    -- Only save persistent data, not transient state like RTT
+    to_save[dev_id] = {
+      lease   = rec.lease,
+      modem   = rec.modem,
+      channel = rec.channel
+    }
+  end
+  U.write_json(REGISTRY_PATH, to_save)
+  Log.info("system", "Saved registry with " .. tostring(table.getn(M.registry) or 0) .. " workers.")
+end
+
+local function load_registry()
+  M.registry = {}
+  local loaded = U.read_json(REGISTRY_PATH, {})
+  for dev_id, rec in pairs(loaded) do
+    local id = tonumber(dev_id) or dev_id
+    M.registry[id] = {
+      dev_id       = id,
+      lease        = rec.lease,
+      modem        = rec.modem,
+      channel      = rec.channel,
+      last_rtt     = nil,
+      last_ping_ts = nil,
+      last_status  = nil
+    }
+  end
+  local count = 0; for _ in pairs(M.registry) do count = count + 1 end
+  Log.info("system", "Loaded " .. tostring(count) .. " workers from registry.")
+end
 
 local function cfg_attempt_limit() return (Cfg.security and Cfg.security.pairing_attempt_limit) or 4 end
 local function cfg_quarantine_ttl() return (Cfg.security and Cfg.security.quarantine_ttl_ms) or (15*60*1000) end
@@ -31,25 +66,16 @@ local function now() return U.now_ms() end
 
 local function pick_wireless_modem()
   local names = peripheral.getNames()
-  local first_modem = nil
   for _, name in ipairs(names) do
     if peripheral.getType(name) == "modem" then
       local m = peripheral.wrap(name)
-      if m then
-        local isW = (m.isWireless and m.isWireless()) and true or false
-        if isW then
-          M._modem, M._modem_name = m, name
-          return m
-        end
-        if not first_modem then first_modem = { obj=m, name=name } end
+      if m and m.isWireless and m.isWireless() then
+        M._modem, M._modem_name = m, name
+        return m
       end
     end
   end
-  if first_modem then
-    error(("No wireless modem found. Only wired modem '%s'. Attach a wireless/ender modem."):format(first_modem.name))
-  else
-    error("No modem found. Attach a wireless modem.")
-  end
+  error("No wireless modem found. Attach a wireless/ender modem.")
 end
 
 local function modem_or_error()
@@ -57,23 +83,15 @@ local function modem_or_error()
   return pick_wireless_modem()
 end
 
-local function dbg_open_channels(tag, ch)
-  if not DEBUG then return end
-  local m = modem_or_error()
-  print(("[JoinService][%s][%s] isOpen(%d)=%s"):format(tag, M._modem_name or "?", ch, tostring(m.isOpen and m.isOpen(ch) or false)))
-end
-
 local function ensure_only_port_open(port)
   local m = modem_or_error()
   if m.closeAll then pcall(function() m.closeAll() end) end
   if not m.isOpen(port) then pcall(function() m.open(port) end) end
-  dbg_open_channels("ensure_only_port_open", port)
 end
 
 local function close_port(port)
   local m = modem_or_error()
   if port and m.isOpen(port) then pcall(function() m.close(port) end) end
-  dbg_open_channels("close_port", port)
 end
 
 local function send_on(tbl)
@@ -87,12 +105,17 @@ local function is_port_secure(port)
   local m = modem_or_error()
   if m.closeAll then pcall(function() m.closeAll() end) end
   if not m.isOpen(port) then pcall(function() m.open(port) end) end
+  print(("[JoinService] Testing port %d on %s for noise (2s)..."):format(port, M._modem_name or "?"))
   local t = os.startTimer(2.0)
   while true do
-    local ev, side, ch = os.pullEvent()
-    if ev=="timer" and side==t then break
-    elseif ev=="modem_message" and ch==port then return false end
+    local ev, side, channel = os.pullEvent()
+    if ev == "timer" and side == t then break
+    elseif ev == "modem_message" and channel == port then
+      print("[JoinService] Noise detected.")
+      return false
+    end
   end
+  print("[JoinService] Port appears quiet.")
   return true
 end
 
@@ -103,7 +126,7 @@ function M.start_pairing_on_port(port)
   ensure_only_port_open(port)
   M.port, M.code = port, ("%04d"):format(math.random(0,9999))
   M.expires, M.pairing_active = now() + cfg_pairing_window(), true
-  M.attempts, M.quarantine, M.sessions, M.pending, M.approved, M.registry = {}, {}, {}, {}, {}, {}
+  M.attempts, M.quarantine, M.sessions, M.pending = {}, {}, {}, {}
   M._last_ready_ms = 0
   Log.info("system", ("Pairing started on %s port %d with code %s"):format(M._modem_name or "modem", M.port, M.code))
   return true
@@ -119,7 +142,6 @@ function M.get_active_code()  return M.pairing_active and M.code or nil end
 function M.get_active_port()  return M.pairing_active and M.port or nil end
 function M.get_pending()      return M.pending end
 
--- Registry/Workers
 function M.get_workers()
   local list = {}
   for dev, rec in pairs(M.registry) do
@@ -136,7 +158,6 @@ function M.get_workers()
   return list
 end
 
--- Generic encrypted command sender
 function M.send_command(dev_id, inner_tbl)
   local sess = M.sessions[dev_id]
   if not sess then return false, "no_session" end
@@ -144,22 +165,26 @@ function M.send_command(dev_id, inner_tbl)
   return true
 end
 
-function M.ping_worker(dev_id)     return M.send_command(dev_id, { type="PING",   ts=now() }) end
-function M.status_worker(dev_id)   return M.send_command(dev_id, { type="STATUS", ts=now() }) end
+function M.ping_worker(dev_id)
+  local r = M.registry[dev_id]
+  if r then r.last_ping_ts = now() end
+  return M.send_command(dev_id, { type="PING", ts=now() })
+end
+
+function M.status_worker(dev_id) return M.send_command(dev_id, { type="STATUS", ts=now() }) end
+
 function M.log_worker(dev_id, text)
   return M.send_command(dev_id, { type="LOG", msg=tostring(text), ts=now() })
 end
+
 function M.fire_worker(dev_id, args)
   local fire = { type="FIRE", rounds=(args and args.rounds) or 1, ts=now() }
-  if args and args.aim     then fire.aim = args.aim end
-  if args and args.ttl_ms  then fire.ttl_ms = args.ttl_ms end
-  if args and args.when_ms then fire.when_ms = args.when_ms end
+  if args and args.aim then fire.aim = args.aim end
   return M.send_command(dev_id, fire)
 end
+
 function M.aim_worker(dev_id, yaw, pitch, opts)
   local aim = { type="AIM", aim={ yaw=tonumber(yaw), pitch=tonumber(pitch) }, ts=now() }
-  if opts and opts.ttl_ms  then aim.ttl_ms  = opts.ttl_ms end
-  if opts and opts.when_ms then aim.when_ms = opts.when_ms end
   return M.send_command(dev_id, aim)
 end
 
@@ -176,6 +201,7 @@ function M.approve_index(i)
   local lease = HS.issue_lease(rec.hello, Cfg.security.lease_ttl_ms, { caps={can_fire=true, can_aim=true}, min_cooldown_ms=(Cfg.security and Cfg.security.min_cooldown_ms) or 3000 })
   send_on(Net.wrap(sess, { type="JOIN_WELCOME", accepted=true, cluster_id=Cfg.system.cluster_id, lease=lease }, { dev=dev_id }))
   M.registry[dev_id] = { dev_id=dev_id, lease=lease, modem=M._modem_name or "modem", channel=M.port, last_rtt=nil, last_ping_ts=nil, last_status=nil }
+  save_registry()
   table.remove(M.pending, i)
   Log.info("system", ("Approved join: %s"):format(rec.id))
   return true
@@ -196,7 +222,6 @@ local function handle_join_hello(msg)
   local dev_id = msg.device_id or -1
   local q = M.quarantine[dev_id]
   if q and q > now() then send_on({ type="JOIN_DENY", reason="quarantine", until_ms=q }); return end
-
   local ok = HS.verify_join_hello(msg, M.code)
   if not ok then
     local attempts = (M.attempts[dev_id] or 0) + 1; M.attempts[dev_id]=attempts
@@ -210,7 +235,6 @@ local function handle_join_hello(msg)
     end
     return
   end
-
   local seed = HS.build_welcome_seed(dev_id, M.code, msg.nonceW)
   send_on(seed)
   M.sessions[dev_id] = HS.derive_pair_session(M.code, dev_id, msg.nonceW, seed.nonceM, Net)
@@ -233,7 +257,8 @@ local function handle_enc_frame(frame)
   end
 end
 
-local function handle_modem_message(side, channel, replyChannel, msg, dist)
+local function handle_modem_message(side, channel, reply, msg, dist)
+  Log.info("pairing", ("RX on %s ch=%s type=%s"):format(M._modem_name or "modem", tostring(channel), (type(msg)=="table" and msg.type) or type(msg)))
   if type(msg)=="table" and msg.type=="ENC" then handle_enc_frame(msg); return end
   if not M.pairing_active then
     if type(msg)=="table" and msg.type=="PAIR_PROBE" and channel==M.port then send_on({ type="PAIR_READY", port=M.port }) end
@@ -247,6 +272,7 @@ local function handle_modem_message(side, channel, replyChannel, msg, dist)
 end
 
 function M.run()
+  load_registry()
   modem_or_error()
   while true do
     local t = os.startTimer(0.25)
